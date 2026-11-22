@@ -1,6 +1,6 @@
 # ClashYuka
 
-基于 Mihomo 的轻量级原生桌面代理客户端。当前完成 P0（工程基础）与 P1（Mihomo Core 集成与通信层），GUI 仍是最小验证窗口。
+基于 Mihomo 的轻量级原生桌面代理客户端。当前完成 P0（工程基础）、P1（Mihomo Core 集成与通信层）、P2.0（MD3 自绘 UI 系统）与 P2.0.1（Material Motion 打磨）。
 
 ## 技术栈
 
@@ -13,6 +13,10 @@
 
 | 模块 | 位置 | 说明 |
 | --- | --- | --- |
+| MD3 主题令牌 | `include/clashyuka/ui/theme` | 4 套配色 × Light/Dark、字体、圆角、间距、DPI |
+| 绘制层 | `include/clashyuka/ui/drawing` | Painter、矢量图标、统一动画管理器、MotionTokens、Ripple |
+| 组件库 | `include/clashyuka/ui/components` | Card/Button/IconButton/Switch/ListItem/Rail/Tab/Dialog/Snackbar/Progress |
+| Demo | `include/clashyuka/ui/demo_frame.h`, `src/ui/demo_frame.cpp` | 组件展示与主题切换 |
 | 数据模型与 JSON 解析 | `include/clashyuka/mihomo/types.h`, `src/mihomo/json.cpp` | 容错解析，未知字段/类型不匹配不会导致崩溃 |
 | 统一错误 | `include/clashyuka/core/result.h` | `ErrorKind` + `Result<T>`，不向调用方暴露 httplib/nlohmann 异常 |
 | REST 客户端 | `include/clashyuka/mihomo/api_client.h` | 每次请求独立连接，可跨线程使用 |
@@ -58,6 +62,61 @@ Mihomo 的 `/logs`、`/traffic`、`/memory`、`/connections` 官方同时支持 
 `MihomoProcess` 支持 Start/Stop/Restart/IsRunning/GetPid/GetExitCode，捕获 stdout/stderr 行，并通过监控线程上报退出码。内核路径与参数（如 `-f config.yaml -d home`）由调用方显式提供，不自动下载或替换内核。
 
 `wxProcess` 已评估，但其退出通知依赖 GUI 消息泵，无法在无界面验证和关闭时序中可靠工作；因此启动/等待放在 `src/platform` 后端中实现，公共模块不出现 `CreateProcess`/`fork`。
+
+Windows 停止流程：GUI 进程无控制台时先 `AttachConsole` 并向子进程组发送 `CTRL_BREAK_EVENT`，等待 3 秒后才 `TerminateProcess`；测试进程自带控制台，因此自动化测试只验证强制终止路径。
+
+## MD3 设计系统
+
+- 主题：Purple / Blue / Teal / Orange，每套都有完整 Light/Dark 颜色令牌
+- 切换主题与深浅色无需重启，组件通过 `ThemeManager` 观察者即时重绘
+- 动画由单个 `wxTimer`（16ms）驱动的 `AnimationManager` 统一调度，组件不自建定时器
+- 所有尺寸通过 `wxWindow::FromDIP` 缩放；不直接使用物理像素
+- 自定义图标为 24×24 网格矢量描边，无外部图标资源
+
+### 动效（P2.0.1）
+
+时长与曲线集中在 `include/clashyuka/ui/drawing/motion_tokens.h`，组件内不写魔法数字：
+
+| 动效 | 时长 |
+| --- | --- |
+| Hover / Disabled 颜色 | 140ms |
+| Press / Release | 110 / 130ms |
+| Focus 状态层 | 120ms |
+| Switch、Tab、NavigationRail | 180 / 200 / 200ms |
+| Surface / Dialog / Snackbar 进入 | 200ms |
+| Surface 退出 | 160ms |
+| 页面切换 | 180ms |
+| Ripple | 420ms |
+| 进度插值 | 220ms |
+
+曲线：`Linear`、`Standard (0.2, 0, 0, 1)`、`EmphasizedDecelerate`、`EmphasizedAccelerate`、`EaseOutCubic`、`EaseInOutCubic`，贝塞尔曲线内置求解，无外部依赖。
+
+- Button / IconButton：Hover、Press 缩放、按点击位置发起的 Ripple（圆角裁剪）、键盘 Focus 状态层（无描边焦点框）、Disabled 过渡
+- Switch：Thumb 位置与尺寸、Track 颜色同步动画
+- ListItem：Hover / Pressed / 选中态背景与前景色过渡、按点击位置发起的 Ripple（圆角裁剪），不改变布局
+- SurfaceCard：Hover / Pressed 背景与描边过渡
+- NavigationRail / TabBar：指示器平滑移动、宽度变化、文字颜色交叉渐变
+- Dialog：无系统标题栏的 MD3 圆角窗口（`SetShape` 裁剪）、自绘标题行与关闭图标、标题区可拖动；整窗淡入 + 内容轻微上移，关闭/ESC 时反向淡出下滑后再结束模态循环（Windows 分层窗口；其他平台保持不透明）；Snackbar：滑入淡入、可复用同一条消息实例
+- ProgressIndicator：确定进度插值并带完成脉冲；不确定进度连续旋转
+- 页面切换：新页面轻微上滑进入，快速连续切换会重置上一段动画
+
+关闭动画或开启 Reduced Motion 时，所有动画立即到达最终状态，交互与状态仍然可用；不执行 Ripple、缩放、位移与旋转。
+
+Demo 窗口（`ClashYuka.exe`）快捷键：
+
+| 快捷键 | 作用 |
+| --- | --- |
+| F1 / F2 / F3 / F4 / F5 | Overview / Components / Feedback / Motion / About |
+| Ctrl+1..4 | Purple / Blue / Teal / Orange |
+| Ctrl+D | 切换深色模式 |
+| Ctrl+M / Ctrl+R | 开关动画 / Reduced Motion |
+| Ctrl+T | 切换组件页 Tab |
+| Ctrl+S | 显示 Snackbar |
+| Ctrl+E | 显示 Dialog |
+
+Motion 页面提供动画开关、Reduced Motion、按钮/图标按钮按压、Switch、进度与 Snackbar 的直接演示。
+
+界面截图位于 `docs/screenshots/`：主题（`theme-*.png`）、Dialog、Snackbar、Motion 页（`motion-page.png`、`release-motion.png`）、动画关闭（`animations-off.png`）、Reduced Motion（`reduced-motion.png`）、组件状态（`button-ripple.png`、`switch-states.png`、`rail-selected.png`、`tab-indicator.png`）。
 
 ## 平台状态
 
@@ -105,9 +164,10 @@ ctest --preset windows-x64-release --output-on-failure
 ctest --preset windows-x64-debug --output-on-failure
 ```
 
-包含两个 CTest 目标：
+包含三个 CTest 目标：
 
 - `clashyuka_tests`：数据模型/JSON、URL 编码、Mock HTTP（鉴权、PUT、错误、超时）、Mock WebSocket（收发、异常消息、主动断开、重连、析构清理）
+- `clashyuka_ui_tests`：主题/DPI/形状令牌、缓动函数端点与单调性、Bezier 插值、动画中途改目标、动画取消与 Handle 析构、多动画并行
 - `clashyuka_process_tests`：进程启动、输出捕获、退出码、重复启动/停止、重启、非法路径
 
 真实内核验证不注册进 CTest（需要外部 mihomo）：

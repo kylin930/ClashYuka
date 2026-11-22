@@ -1,6 +1,6 @@
 #include "app/app.h"
 
-#include "ui/main_frame.h"
+#include "clashyuka/ui/demo_frame.h"
 
 namespace clashyuka::app {
 
@@ -11,7 +11,7 @@ bool ClashYukaApp::OnInit() {
 
     SetAppName("ClashYuka");
 
-    auto* frame = new ui::MainFrame();
+    auto* frame = new ui::DemoFrame();
     frame->Show();
     return true;
 }
