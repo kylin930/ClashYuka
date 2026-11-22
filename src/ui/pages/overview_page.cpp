@@ -59,8 +59,9 @@ OverviewPage::OverviewPage(wxWindow* parent, app::AppController& controller)
     AddRow(profileSizer, profileCard, "Profile", profileValue_, "No profile loaded");
     RowGap(profileSizer, profileCard);
     AddRow(profileSizer, profileCard, "Mode", modeValue_, "Rule");
-    statusRow->Add(coreCard, 1, wxRIGHT, FromDIP(SpaceDp(Space::Lg)));
-    statusRow->Add(profileCard, 1);
+    profileCard->SetContent(profileSizer, 20);
+    statusRow->Add(coreCard, 1, wxEXPAND | wxRIGHT, FromDIP(SpaceDp(Space::Lg)));
+    statusRow->Add(profileCard, 1, wxEXPAND);
     sizer->Add(statusRow, 0, wxEXPAND);
 
     pages::AddSpacer(sizer, this, SpaceDp(Space::Lg));
