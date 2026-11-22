@@ -15,6 +15,8 @@ public:
     TextBlock(wxWindow* parent, wxString text, TypeStyle style, int alpha = 255);
 
     void SetText(const wxString& text);
+    // Horizontal alignment inside the window rect (wxALIGN_LEFT by default).
+    void SetAlignment(int alignment);
     wxSize DoGetBestClientSize() const override;
 
 protected:
@@ -24,6 +26,7 @@ private:
     wxString text_;
     TypeStyle style_;
     int alpha_;
+    int alignment_ = wxALIGN_LEFT;
     double contentAlpha_ = 1.0;
     std::shared_ptr<AnimationHandle> fadeAnimation_;
 };

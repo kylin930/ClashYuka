@@ -50,6 +50,23 @@ std::string BuildCommandLine(const ProcessSpawnOptions& options) {
     return command;
 }
 
+// Arguments and paths reach this layer as UTF-8. CreateProcessW keeps non-ASCII
+// paths working on all Windows code pages.
+std::wstring ToWide(const std::string& value) {
+    if (value.empty()) {
+        return {};
+    }
+    const int length = ::MultiByteToWideChar(CP_UTF8, 0, value.data(),
+                                             static_cast<int>(value.size()), nullptr, 0);
+    if (length <= 0) {
+        return {};
+    }
+    std::wstring wide(static_cast<std::size_t>(length), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                          wide.data(), length);
+    return wide;
+}
+
 void PumpLines(std::string& pending, std::string_view data,
                const ProcessBackend::LineHandler& handler) {
     if (!handler) {
@@ -108,7 +125,9 @@ bool CreatePipePair(HANDLE& readHandle, HANDLE& writeHandle) {
 
 // Console control events only reach processes attached to the same console.
 // This is intentionally limited to GUI processes without a console, so a
-// CTRL_BREAK can never leak into the user's terminal.
+// CTRL_BREAK can never leak into the user's terminal. The event is addressed to
+// the child's process group (CreateProcess used CREATE_NEW_PROCESS_GROUP), not
+// group 0: group 0 would also hit this application once it attaches.
 bool RequestConsoleBreak(DWORD pid) {
     if (::GetConsoleWindow() != nullptr) {
         return false;
@@ -117,7 +136,7 @@ bool RequestConsoleBreak(DWORD pid) {
         return false;
     }
     ::SetConsoleCtrlHandler(nullptr, TRUE);
-    const BOOL sent = ::GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0);
+    const BOOL sent = ::GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
     ::FreeConsole();
     return sent != FALSE;
 }
@@ -145,20 +164,20 @@ public:
             return false;
         }
 
-        HANDLE nullInput = ::CreateFileA(
-            "NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+        HANDLE nullInput = ::CreateFileW(
+            L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
             nullptr);
 
-        STARTUPINFOA startup{};
+        STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         startup.dwFlags = STARTF_USESTDHANDLES;
         startup.hStdInput = nullInput != INVALID_HANDLE_VALUE ? nullInput : nullptr;
         startup.hStdOutput = stdoutWrite;
         startup.hStdError = stderrWrite;
 
-        std::string command = BuildCommandLine(options);
+        std::wstring command = ToWide(BuildCommandLine(options));
         PROCESS_INFORMATION processInfo{};
-        const BOOL created = ::CreateProcessA(
+        const BOOL created = ::CreateProcessW(
             nullptr, command.data(), nullptr, nullptr, TRUE,
             CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr,
             &startup, &processInfo);

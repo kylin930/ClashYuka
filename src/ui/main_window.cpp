@@ -8,9 +8,11 @@
 #include <wx/dcbuffer.h>
 #include <wx/scrolwin.h>
 #include <wx/sizer.h>
+#include <wx/weakref.h>
 
 #include "clashyuka/app/app_text.h"
 #include "clashyuka/app/page_registry.h"
+#include "clashyuka/core/timing.h"
 #include "clashyuka/ui/components/button.h"
 #include "clashyuka/ui/components/dialog.h"
 #include "clashyuka/ui/components/icon_button.h"
@@ -77,6 +79,7 @@ private:
                 dot = colors.primary;
                 break;
             case app::KernelState::Starting:
+            case app::KernelState::WaitingForApi:
             case app::KernelState::Stopping:
                 dot = colors.tertiary;
                 break;
@@ -112,20 +115,36 @@ private:
 MainWindow::MainWindow()
     : wxFrame(nullptr, wxID_ANY, "ClashYuka", wxDefaultPosition, wxDefaultSize),
       controller_(this) {
+    core::MarkStartup("main-window-constructed");
+
     ThemeManager::Instance().AddObserver(this);
     controller_.State().AddObserver(this);
 
     BuildUi();
     Bind(wxEVT_SIZE, &MainWindow::OnSize, this);
+    Bind(wxEVT_CLOSE_WINDOW, &MainWindow::OnClose, this);
     SetMinClientSize(FromDIP(wxSize(880, 600)));
     SetClientSize(FromDIP(wxSize(1100, 720)));
     Centre();
 
     ActivatePage(controller_.Snapshot().currentPage);
     UpdateResponsiveRail();
+
+    // The window is shown before the kernel is initialized so a slow or failing
+    // Mihomo start never delays the first paint. The weak reference keeps a
+    // close-before-idle sequence from calling into a destroyed window.
+    wxWeakRef<MainWindow> self(this);
+    CallAfter([self] {
+        if (!self) {
+            return;
+        }
+        core::MarkStartup("main-window-shown");
+        self->controller_.InitializeRuntime();
+    });
 }
 
 MainWindow::~MainWindow() {
+    controller_.ShutdownRuntime();
     AnimationManager::Instance().StopAll();
     controller_.State().RemoveObserver(this);
     ThemeManager::Instance().RemoveObserver(this);
@@ -278,6 +297,13 @@ void MainWindow::UpdateResponsiveRail() {
 
 void MainWindow::OnSize(wxSizeEvent& event) {
     UpdateResponsiveRail();
+    event.Skip();
+}
+
+void MainWindow::OnClose(wxCloseEvent& event) {
+    // Stop the worker, cancel readiness, close WebSockets and stop the kernel
+    // before the window (and its observers) go away.
+    controller_.ShutdownRuntime();
     event.Skip();
 }
 

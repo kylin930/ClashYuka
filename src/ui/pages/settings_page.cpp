@@ -2,12 +2,16 @@
 
 #include <utility>
 
+#include <wx/filedlg.h>
 #include <wx/sizer.h>
 
 #include "clashyuka/app/app_controller.h"
+#include "clashyuka/app/app_text.h"
 #include "clashyuka/core/app_info.h"
+#include "clashyuka/runtime/settings_store.h"
 #include "clashyuka/ui/components/button.h"
 #include "clashyuka/ui/components/list_item.h"
+#include "clashyuka/ui/components/search_field.h"
 #include "clashyuka/ui/components/switch.h"
 #include "clashyuka/ui/components/text_block.h"
 #include "clashyuka/ui/pages/page_utils.h"
@@ -131,18 +135,55 @@ SettingsPage::SettingsPage(wxWindow* parent, app::AppController& controller)
     // --- Mihomo ------------------------------------------------------------
     wxSizer* mihomoSizer = nullptr;
     auto* mihomo = MakeSection(this, "Mihomo", &mihomoSizer);
-    kernelPathItem_ = MakeDisabledItem(mihomo, "Kernel path", "Not configured", "P2.2");
-    kernelPathItem_->SetLeadingIcon(IconId::Settings);
-    mihomoSizer->Add(kernelPathItem_, 0, wxEXPAND);
-    apiItem_ = MakeDisabledItem(mihomo, "API address", "Not configured", "P2.2");
-    apiItem_->SetLeadingIcon(IconId::Wifi);
-    mihomoSizer->Add(apiItem_, 0, wxEXPAND);
-    secretItem_ = MakeDisabledItem(mihomo, "Secret", "Not configured", "P2.2");
-    secretItem_->SetLeadingIcon(IconId::Info);
-    mihomoSizer->Add(secretItem_, 0, wxEXPAND);
+    kernelStatusLine_ = new TextBlock(mihomo, "Kernel: Not started", TypeStyle::Label, 170);
+    mihomoSizer->Add(kernelStatusLine_, 0, wxEXPAND);
+    pages::AddSpacer(mihomoSizer, mihomo, SpaceDp(Space::Sm));
+
+    mihomoSizer->Add(new TextBlock(mihomo, "Mihomo executable", TypeStyle::Body), 0, wxEXPAND);
+    pages::AddSpacer(mihomoSizer, mihomo, SpaceDp(Space::Xs));
+    auto* pathRow = new wxBoxSizer(wxHORIZONTAL);
+    kernelPathField_ = new SearchField(mihomo, "Path to the mihomo executable", std::nullopt);
+    auto* browse = new Button(mihomo, "Browse", ButtonVariant::Outlined);
+    browse->SetOnClick([this] { BrowseKernelPath(); });
+    pathRow->Add(kernelPathField_, 1, wxEXPAND | wxRIGHT, FromDIP(SpaceDp(Space::Sm)));
+    pathRow->Add(browse, 0, wxALIGN_CENTER_VERTICAL);
+    mihomoSizer->Add(pathRow, 0, wxEXPAND);
     pages::AddSpacer(mihomoSizer, mihomo, SpaceDp(Space::Md));
+
+    auto* portRow = new wxBoxSizer(wxHORIZONTAL);
+    portRow->Add(new TextBlock(mihomo, "API port", TypeStyle::Body), 0,
+                 wxALIGN_CENTER_VERTICAL);
+    portRow->AddStretchSpacer();
+    apiPortField_ = new SearchField(mihomo, "9090", std::nullopt);
+    apiPortField_->SetMinSize(wxSize(FromDIP(120), -1));
+    portRow->Add(apiPortField_, 0, wxALIGN_CENTER_VERTICAL);
+    mihomoSizer->Add(portRow, 0, wxEXPAND);
+    pages::AddSpacer(mihomoSizer, mihomo, SpaceDp(Space::Md));
+
+    auto* secretRow = new wxBoxSizer(wxHORIZONTAL);
+    secretRow->Add(new TextBlock(mihomo, "API secret", TypeStyle::Body), 0,
+                   wxALIGN_CENTER_VERTICAL);
+    secretRow->AddStretchSpacer();
+    secretField_ = new SearchField(mihomo, "Secret", std::nullopt, true);
+    secretField_->SetMinSize(wxSize(FromDIP(260), -1));
+    secretRow->Add(secretField_, 0, wxALIGN_CENTER_VERTICAL);
+    mihomoSizer->Add(secretRow, 0, wxEXPAND);
+    pages::AddSpacer(mihomoSizer, mihomo, SpaceDp(Space::Md));
+
+    autoStart_ = new Switch(mihomo);
+    AddSettingRow(mihomoSizer, mihomo, "Start kernel with the app", autoStart_);
+    pages::AddSpacer(mihomoSizer, mihomo, SpaceDp(Space::Md));
+
+    auto* saveRow = new wxBoxSizer(wxHORIZONTAL);
+    auto* save = new Button(mihomo, "Save Mihomo settings", ButtonVariant::Filled);
+    save->SetOnClick([this] { SaveMihomoSettings(); });
+    saveRow->Add(save, 0);
+    mihomoSizer->Add(saveRow, 0, wxEXPAND);
+    pages::AddSpacer(mihomoSizer, mihomo, SpaceDp(Space::Sm));
     AddParagraph(mihomoSizer, mihomo,
-                 "Kernel supervision and API credentials are wired in the next stage.");
+                 "The secret is stored as plain text in the per-user application data "
+                 "directory, with the same trust boundary as the Mihomo config. Settings "
+                 "that affect a running kernel take effect after a restart.");
     sizer->Add(mihomo, 0, wxEXPAND);
 
     pages::AddSpacer(sizer, this, SpaceDp(Space::Lg));
@@ -165,7 +206,7 @@ SettingsPage::SettingsPage(wxWindow* parent, app::AppController& controller)
     auto* about = MakeSection(this, "About", &aboutSizer);
     aboutSizer->Add(new TextBlock(about, "ClashYuka", TypeStyle::Headline), 0, wxEXPAND);
     AddParagraph(aboutSizer, about,
-                 wxString::FromUTF8("Version 0.2.0 · P2.1 application shell"), 200);
+                 wxString::FromUTF8("Version 0.2.0 · P2.2 runtime integration"), 200);
     pages::AddSpacer(aboutSizer, about, SpaceDp(Space::Sm));
     AddParagraph(aboutSizer, about,
                  wxString::FromUTF8("C++20 · wxWidgets 3.3.1 · MD3 painted with "
@@ -207,12 +248,62 @@ void SettingsPage::ApplyState(const app::AppStateSnapshot& state) {
     animations_->SetValue(state.animationsEnabled, false);
     reducedMotion_->SetValue(state.reducedMotion, false);
 
-    kernelPathItem_->SetSubtitle(state.kernelPath.empty()
-                                     ? wxString("Not configured")
-                                     : wxString::FromUTF8(state.kernelPath));
-    apiItem_->SetSubtitle(state.apiAddress.empty() ? wxString("Not configured")
-                                                   : wxString::FromUTF8(state.apiAddress));
-    secretItem_->SetSubtitle("Not configured");
+    if (kernelStatusLine_ != nullptr) {
+        kernelStatusLine_->SetText("Kernel: " + app::KernelStateText(state.kernel) + "   ·   " +
+                                   "API: " + app::ApiStateText(state.api));
+    }
+    if (!mihomoFieldsInitialized_ && Controller().RuntimeInitialized()) {
+        SyncMihomoSettings();
+        mihomoFieldsInitialized_ = true;
+    }
+}
+
+void SettingsPage::SyncMihomoSettings() {
+    const runtime::AppSettings& settings = Controller().Settings();
+    kernelPathField_->SetValue(wxString::FromUTF8(settings.mihomoPath));
+    apiPortField_->SetValue(wxString::Format("%d", settings.controllerPort));
+    secretField_->SetValue(wxString::FromUTF8(settings.secret));
+    autoStart_->SetValue(settings.autoStartKernel, false);
+}
+
+void SettingsPage::BrowseKernelPath() {
+#ifdef __WXMSW__
+    const wxString wildcard = "Mihomo executable (*.exe)|*.exe|All files (*.*)|*.*";
+#else
+    const wxString wildcard = "All files (*.*)|*.*";
+#endif
+    wxFileDialog dialog(this, "Select the Mihomo executable", wxEmptyString,
+                        kernelPathField_->GetValue(), wildcard,
+                        wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dialog.ShowModal() == wxID_OK) {
+        kernelPathField_->SetValue(dialog.GetPath());
+    }
+}
+
+void SettingsPage::SaveMihomoSettings() {
+    wxString portText = apiPortField_->GetValue();
+    portText.Trim(true).Trim(false);
+    long port = 0;
+    if (!portText.ToLong(&port)) {
+        Controller().ShowMessage("The API port must be a number.");
+        return;
+    }
+
+    runtime::AppSettings settings = Controller().Settings();
+    settings.mihomoPath = kernelPathField_->GetValue().utf8_string();
+    settings.controllerPort = static_cast<int>(port);
+    settings.secret = secretField_->GetValue().utf8_string();
+    settings.autoStartKernel = autoStart_->GetValue();
+
+    wxString error;
+    bool restartRequired = false;
+    if (!Controller().SaveKernelSettings(settings, &error, &restartRequired)) {
+        Controller().ShowMessage("Could not save Mihomo settings: " + error);
+        return;
+    }
+    Controller().ShowMessage(restartRequired
+                                 ? "Settings saved. Restart the running kernel to apply them."
+                                 : "Mihomo settings saved.");
 }
 
 }  // namespace clashyuka::ui

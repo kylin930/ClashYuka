@@ -11,6 +11,7 @@
 #include "clashyuka/ui/theme/theme_manager.h"
 
 class wxBoxSizer;
+class wxCloseEvent;
 class wxPanel;
 class wxScrolledWindow;
 class wxSizeEvent;
@@ -47,6 +48,7 @@ private:
     void UpdateChrome();
     void UpdateResponsiveRail();
     void OnSize(wxSizeEvent& event);
+    void OnClose(wxCloseEvent& event);
 
     app::AppController controller_;
 

@@ -57,7 +57,10 @@ if(WIN32)
   target_link_libraries(clashyuka_platform PUBLIC advapi32)
 endif()
 
-add_library(clashyuka_core STATIC src/core/app_info.cpp)
+add_library(clashyuka_core STATIC
+  src/core/app_info.cpp
+  src/core/timing.cpp
+)
 target_include_directories(clashyuka_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(clashyuka_core
   PUBLIC
@@ -112,6 +115,24 @@ add_library(clashyuka_process STATIC
 )
 target_include_directories(clashyuka_process PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(clashyuka_process PUBLIC clashyuka_options Threads::Threads)
+
+# --- Runtime orchestration (settings, runtime config, kernel session) --------
+add_library(clashyuka_runtime STATIC
+  src/runtime/settings_store.cpp
+  src/runtime/runtime_config.cpp
+  src/runtime/kernel_session.cpp
+)
+target_include_directories(clashyuka_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(clashyuka_runtime
+  PUBLIC
+    clashyuka_options
+    clashyuka_core
+    clashyuka_mihomo
+    clashyuka_process
+    nlohmann_json::nlohmann_json
+    yaml-cpp::yaml-cpp
+    Threads::Threads
+)
 
 # --- MD3 design system ------------------------------------------------------
 add_library(clashyuka_ui STATIC
@@ -171,6 +192,7 @@ if(MSVC)
 endif()
 target_link_libraries(clashyuka_app PUBLIC
   clashyuka_core
+  clashyuka_runtime
   clashyuka_ui
   ${wxWidgets_LIBRARIES}
 )
@@ -233,6 +255,16 @@ if(CLASHYUKA_BUILD_TESTS)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   add_test(NAME clashyuka_app_tests COMMAND clashyuka_app_tests)
+
+  add_executable(clashyuka_runtime_tests tests/test_runtime.cpp)
+  target_link_libraries(clashyuka_runtime_tests PRIVATE
+    clashyuka_runtime
+    doctest::doctest
+  )
+  set_target_properties(clashyuka_runtime_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  add_test(NAME clashyuka_runtime_tests COMMAND clashyuka_runtime_tests)
 
   add_executable(clashyuka_process_probe tests/helpers/process_probe.cpp)
   set_target_properties(clashyuka_process_probe PROPERTIES

@@ -16,7 +16,7 @@ enum class PageId {
     Settings,
 };
 
-enum class KernelState { NotStarted, Starting, Running, Stopping, Error };
+enum class KernelState { NotStarted, Starting, WaitingForApi, Running, Stopping, Error };
 
 enum class ApiState { Disconnected, Connecting, Connected };
 
@@ -47,6 +47,9 @@ struct AppStateSnapshot {
 
     std::string kernelPath;
     std::string apiAddress;
+    // Friendly, user-facing text for the last kernel failure. Technical detail
+    // stays in the runtime log.
+    std::string kernelError;
 };
 
 class AppStateObserver {
@@ -78,6 +81,7 @@ public:
     void SetConnectionCount(int count);
     void SetKernelPath(std::string path);
     void SetApiAddress(std::string address);
+    void SetKernelError(std::string error);
 
 private:
     void Notify();

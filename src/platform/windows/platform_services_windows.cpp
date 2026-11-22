@@ -1,9 +1,15 @@
 #include "clashyuka/platform/platform_services.h"
 
+#include <filesystem>
+
 #include <windows.h>
 
 namespace clashyuka::platform {
 namespace {
+
+std::filesystem::path Utf8Path(const std::string& value) {
+    return std::filesystem::path(std::u8string(value.begin(), value.end()));
+}
 
 class WindowsPlatformServices final : public PlatformServices {
 public:
@@ -28,6 +34,20 @@ public:
 
 std::unique_ptr<PlatformServices> CreatePlatformServices() {
     return std::make_unique<WindowsPlatformServices>();
+}
+
+bool ReplaceFileAtomically(const std::string& tempPath, const std::string& targetPath,
+                           std::string* error) {
+    const std::filesystem::path temp = Utf8Path(tempPath);
+    const std::filesystem::path target = Utf8Path(targetPath);
+    if (::MoveFileExW(temp.c_str(), target.c_str(),
+                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == FALSE) {
+        if (error != nullptr) {
+            *error = "MoveFileExW failed with error " + std::to_string(::GetLastError());
+        }
+        return false;
+    }
+    return true;
 }
 
 }  // namespace clashyuka::platform

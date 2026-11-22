@@ -2,10 +2,12 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include <wx/textctrl.h>
 
 #include "clashyuka/ui/components/control_base.h"
+#include "clashyuka/ui/drawing/icons.h"
 
 namespace clashyuka::ui {
 
@@ -14,9 +16,13 @@ namespace clashyuka::ui {
 // the field stays consistent with the rest of the design system.
 class SearchField final : public ControlBase {
 public:
-    SearchField(wxWindow* parent, const wxString& placeholder);
+    // The leading icon and password mode are fixed for the lifetime of the
+    // field. Pass std::nullopt for a plain text input.
+    SearchField(wxWindow* parent, const wxString& placeholder,
+                std::optional<IconId> leadingIcon = IconId::Search, bool password = false);
 
     wxString GetValue() const;
+    void SetValue(const wxString& value);
     void Clear();
     void SetPlaceholder(const wxString& placeholder);
     void SetOnChange(std::function<void(const wxString&)> handler);
@@ -34,6 +40,7 @@ private:
 
     wxTextCtrl* input_ = nullptr;
     wxString placeholder_;
+    std::optional<IconId> leadingIcon_;
     bool focused_ = false;
     std::function<void(const wxString&)> onChange_;
 };

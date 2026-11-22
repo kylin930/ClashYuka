@@ -152,4 +152,12 @@ void AppState::SetApiAddress(std::string address) {
     Notify();
 }
 
+void AppState::SetKernelError(std::string error) {
+    if (snapshot_.kernelError == error) {
+        return;
+    }
+    snapshot_.kernelError = std::move(error);
+    Notify();
+}
+
 }  // namespace clashyuka::app

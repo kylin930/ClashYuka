@@ -24,6 +24,14 @@ void TextBlock::SetText(const wxString& text) {
     Refresh();
 }
 
+void TextBlock::SetAlignment(int alignment) {
+    if (alignment_ == alignment) {
+        return;
+    }
+    alignment_ = alignment;
+    Refresh(false);
+}
+
 wxSize TextBlock::DoGetBestClientSize() const {
     const wxFont font = Font(style_);
     int width = 0;
@@ -36,7 +44,7 @@ void TextBlock::PaintContent(Painter& painter, const wxSize& size) {
     const auto alpha = static_cast<std::uint8_t>(alpha_ * contentAlpha_);
     painter.DrawText(text_.utf8_string(), wxRect(0, 0, size.x, size.y), Font(style_),
                      WithAlpha(Colors().onSurface, alpha),
-                     wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);
+                     alignment_ | wxALIGN_CENTER_VERTICAL);
 }
 
 }  // namespace clashyuka::ui

@@ -17,9 +17,9 @@ void AddRow(wxSizer* sizer, wxWindow* parent, const wxString& label, TextBlock*&
             const wxString& initial) {
     auto* row = new wxBoxSizer(wxHORIZONTAL);
     row->Add(new TextBlock(parent, label, TypeStyle::Label, 170), 0, wxALIGN_CENTER_VERTICAL);
-    row->AddStretchSpacer();
     value = new TextBlock(parent, initial, TypeStyle::Body);
-    row->Add(value, 0, wxALIGN_CENTER_VERTICAL);
+    value->SetAlignment(wxALIGN_RIGHT);
+    row->Add(value, 1, wxALIGN_CENTER_VERTICAL | wxEXPAND);
     sizer->Add(row, 0, wxEXPAND);
 }
 
@@ -33,8 +33,8 @@ OverviewPage::OverviewPage(wxWindow* parent, app::AppController& controller)
     : PageBase(parent, controller, app::PageId::Overview) {
     auto* sizer = new wxBoxSizer(wxVERTICAL);
 
-    sizer->Add(new TextBlock(this, "Mihomo is not running. The shell is ready for the kernel "
-                                   "integration stage.",
+    sizer->Add(new TextBlock(this, "Start the Mihomo core to stream live status and traffic. "
+                                   "The shell stays usable while the kernel starts.",
                              TypeStyle::Body, 170),
                0, wxEXPAND);
     pages::AddSpacer(sizer, this, SpaceDp(Space::Lg));
@@ -64,6 +64,12 @@ OverviewPage::OverviewPage(wxWindow* parent, app::AppController& controller)
     statusRow->Add(profileCard, 1, wxEXPAND);
     sizer->Add(statusRow, 0, wxEXPAND);
 
+    // Full-width so a long failure message can never squeeze the two cards and
+    // clip the Active profile value.
+    errorLabel_ = new TextBlock(this, "", TypeStyle::Label, 190);
+    errorLabel_->Hide();
+    sizer->Add(errorLabel_, 0, wxEXPAND | wxTOP, FromDIP(SpaceDp(Space::Sm)));
+
     pages::AddSpacer(sizer, this, SpaceDp(Space::Lg));
 
     auto* trafficCard = pages::MakeCard(this);
@@ -84,6 +90,15 @@ OverviewPage::OverviewPage(wxWindow* parent, app::AppController& controller)
     pages::AddSpacer(sizer, this, SpaceDp(Space::Lg));
 
     auto* actions = new wxBoxSizer(wxHORIZONTAL);
+    startButton_ = new Button(this, "Start", ButtonVariant::Filled);
+    startButton_->SetOnClick([this] { Controller().StartKernel(); });
+    stopButton_ = new Button(this, "Stop", ButtonVariant::Outlined);
+    stopButton_->SetOnClick([this] { Controller().StopKernel(); });
+    restartButton_ = new Button(this, "Restart", ButtonVariant::Text);
+    restartButton_->SetOnClick([this] { Controller().RestartKernel(); });
+    actions->Add(startButton_, 0, wxRIGHT, FromDIP(SpaceDp(Space::Sm)));
+    actions->Add(stopButton_, 0, wxRIGHT, FromDIP(SpaceDp(Space::Sm)));
+    actions->Add(restartButton_, 0, wxRIGHT, FromDIP(SpaceDp(Space::Xl)));
     auto* proxies = new Button(this, "Open proxies", ButtonVariant::FilledTonal);
     proxies->SetOnClick([this] { Controller().Navigate(app::PageId::Proxies); });
     auto* profiles = new Button(this, "Profiles", ButtonVariant::Outlined);
@@ -127,9 +142,37 @@ void OverviewPage::ApplyState(const app::AppStateSnapshot& state) {
     uploadValue_->SetText(app::FormatSpeed(state.uploadBytesPerSecond, state.trafficAvailable));
     downloadValue_->SetText(
         app::FormatSpeed(state.downloadBytesPerSecond, state.trafficAvailable));
-    trafficNote_->SetText(state.trafficAvailable
-                              ? "Live traffic from the Mihomo event stream."
-                              : "Traffic data is unavailable until the core is running (P2.2).");
+    const bool running = state.kernel == app::KernelState::Running;
+    trafficNote_->SetText(!running
+                              ? "Start the core to stream live traffic."
+                              : (state.trafficAvailable
+                                     ? "Live traffic from the Mihomo event stream."
+                                     : "Waiting for the traffic event stream..."));
+
+    startButton_->Enable(state.kernel == app::KernelState::NotStarted ||
+                         state.kernel == app::KernelState::Error);
+    stopButton_->Enable(state.kernel == app::KernelState::Starting ||
+                        state.kernel == app::KernelState::WaitingForApi ||
+                        state.kernel == app::KernelState::Running);
+    restartButton_->Enable(state.kernel == app::KernelState::NotStarted ||
+                           state.kernel == app::KernelState::Running ||
+                           state.kernel == app::KernelState::Error);
+
+    const bool hasError = !state.kernelError.empty();
+    errorLabel_->SetText(wxString::FromUTF8(state.kernelError));
+    if (errorLabel_->IsShown() != hasError) {
+        errorLabel_->Show(hasError);
+    }
+
+    const std::string signature =
+        std::to_string(static_cast<int>(state.kernel)) + "|" +
+        std::to_string(static_cast<int>(state.api)) + "|" + state.mihomoVersion + "|" +
+        state.profileName + "|" + std::to_string(state.profileLoaded) + "|" +
+        std::to_string(static_cast<int>(state.proxyMode)) + "|" + state.kernelError;
+    if (signature != layoutSignature_) {
+        layoutSignature_ = signature;
+        RequestRelayout();
+    }
 }
 
 }  // namespace clashyuka::ui

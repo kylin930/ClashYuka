@@ -27,4 +27,9 @@ protected:
 // Creates the implementation matching the platform this binary is built for.
 std::unique_ptr<PlatformServices> CreatePlatformServices();
 
+// Replaces target with temp as atomically as the platform allows. Both paths are
+// UTF-8. On failure, error receives a short diagnostic; temp may remain.
+bool ReplaceFileAtomically(const std::string& tempPath, const std::string& targetPath,
+                           std::string* error);
+
 }  // namespace clashyuka::platform

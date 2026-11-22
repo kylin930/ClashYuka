@@ -8,6 +8,7 @@ namespace clashyuka::ui {
 
 class Button;
 class ListItem;
+class SearchField;
 class Switch;
 class TextBlock;
 
@@ -19,14 +20,21 @@ protected:
     void ApplyState(const app::AppStateSnapshot& state) override;
 
 private:
+    void BrowseKernelPath();
+    void SaveMihomoSettings();
+    void SyncMihomoSettings();
+
     Button* lightButton_ = nullptr;
     Button* darkButton_ = nullptr;
     std::array<Button*, 4> themeButtons_{};
     Switch* animations_ = nullptr;
     Switch* reducedMotion_ = nullptr;
-    ListItem* kernelPathItem_ = nullptr;
-    ListItem* apiItem_ = nullptr;
-    ListItem* secretItem_ = nullptr;
+    SearchField* kernelPathField_ = nullptr;
+    SearchField* apiPortField_ = nullptr;
+    SearchField* secretField_ = nullptr;
+    Switch* autoStart_ = nullptr;
+    TextBlock* kernelStatusLine_ = nullptr;
+    bool mihomoFieldsInitialized_ = false;
 };
 
 }  // namespace clashyuka::ui

@@ -18,6 +18,9 @@ enum class ErrorKind {
     MissingField,
     TypeMismatch,
     Cancelled,
+    KernelNotFound,
+    ConfigFailed,
+    StartFailed,
     Internal,
 };
 

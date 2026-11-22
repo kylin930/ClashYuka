@@ -5,6 +5,7 @@
 #include <wx/string.h>
 
 #include "clashyuka/app/app_state.h"
+#include "clashyuka/core/result.h"
 
 namespace clashyuka::app {
 
@@ -14,6 +15,8 @@ inline wxString KernelStateText(KernelState state) {
             return "Not started";
         case KernelState::Starting:
             return "Starting";
+        case KernelState::WaitingForApi:
+            return "Waiting for API";
         case KernelState::Running:
             return "Running";
         case KernelState::Stopping:
@@ -60,6 +63,38 @@ inline wxString FormatSpeed(double bytesPerSecond, bool available) {
 
 inline wxString FormatVersion(const std::string& version) {
     return version.empty() ? wxString("Unknown") : wxString::FromUTF8(version);
+}
+
+// User-facing explanation for a kernel failure. Raw diagnostics stay in the
+// runtime log so the UI never shows stack traces or transport internals.
+inline wxString KernelErrorText(core::ErrorKind kind) {
+    switch (kind) {
+        case core::ErrorKind::KernelNotFound:
+            return wxString::FromUTF8(
+                "Mihomo executable was not found. Check the kernel path in Settings.");
+        case core::ErrorKind::ConfigFailed:
+            return wxString::FromUTF8(
+                "The runtime configuration could not be prepared. Check the settings and try again.");
+        case core::ErrorKind::AuthFailed:
+            return wxString::FromUTF8(
+                "The Mihomo API rejected the secret. Update the secret in Settings.");
+        case core::ErrorKind::Timeout:
+            return wxString::FromUTF8(
+                "Mihomo started but its API did not become ready in time.");
+        case core::ErrorKind::ConnectionFailed:
+            return wxString::FromUTF8(
+                "Could not reach the Mihomo API. Check the controller address and port.");
+        case core::ErrorKind::StartFailed:
+            return wxString::FromUTF8("Mihomo failed to start or exited unexpectedly.");
+        case core::ErrorKind::Cancelled:
+            return wxString::FromUTF8("The kernel operation was cancelled.");
+        case core::ErrorKind::InvalidConfig:
+            return wxString::FromUTF8("The Mihomo configuration is invalid.");
+        case core::ErrorKind::None:
+            return wxString();
+        default:
+            return wxString::FromUTF8("Mihomo reported an unexpected error.");
+    }
 }
 
 }  // namespace clashyuka::app

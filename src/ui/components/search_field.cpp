@@ -18,11 +18,17 @@ constexpr int kTextHeightDp = 24;
 
 }  // namespace
 
-SearchField::SearchField(wxWindow* parent, const wxString& placeholder)
+SearchField::SearchField(wxWindow* parent, const wxString& placeholder,
+                         std::optional<IconId> leadingIcon, bool password)
     : ControlBase(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize),
-      placeholder_(placeholder) {
+      placeholder_(placeholder),
+      leadingIcon_(leadingIcon) {
+    long style = wxBORDER_NONE | wxTE_PROCESS_ENTER;
+    if (password) {
+        style |= wxTE_PASSWORD;
+    }
     input_ = new wxTextCtrl(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize,
-                            wxBORDER_NONE | wxTE_PROCESS_ENTER);
+                            style);
     input_->SetHint(placeholder_);
     input_->Bind(wxEVT_TEXT, [this](wxCommandEvent& event) {
         if (onChange_) {
@@ -52,6 +58,12 @@ SearchField::SearchField(wxWindow* parent, const wxString& placeholder)
 
 wxString SearchField::GetValue() const {
     return input_ != nullptr ? input_->GetValue() : wxString();
+}
+
+void SearchField::SetValue(const wxString& value) {
+    if (input_ != nullptr) {
+        input_->ChangeValue(value);
+    }
 }
 
 void SearchField::Clear() {
@@ -107,7 +119,7 @@ void SearchField::UpdateChildLayout() {
     const wxSize size = GetClientSize();
     const int height = FromDIP(kTextHeightDp);
     const int top = (size.y - height) / 2;
-    const int left = FromDIP(kTextLeftDp);
+    const int left = FromDIP(leadingIcon_.has_value() ? kTextLeftDp : kTextRightDp);
     const int width = size.x - left - FromDIP(kTextRightDp);
     if (width > 0 && height > 0) {
         input_->SetSize(wxRect(left, top, width, height));
@@ -127,9 +139,11 @@ void SearchField::PaintContent(Painter& painter, const wxSize& size) {
 
     const int icon = FromDIP(kIconDp);
     const int inset = FromDIP(kIconInsetDp);
-    const wxRect iconRect(inset, (size.y - icon) / 2, icon, icon);
-    IconProvider::Draw(painter, IconId::Search, iconRect,
-                       WithAlpha(colors.onSurface, IsEnabled() ? 150 : 80), 1.8);
+    if (leadingIcon_.has_value()) {
+        const wxRect iconRect(inset, (size.y - icon) / 2, icon, icon);
+        IconProvider::Draw(painter, *leadingIcon_, iconRect,
+                           WithAlpha(colors.onSurface, IsEnabled() ? 150 : 80), 1.8);
+    }
 }
 
 }  // namespace clashyuka::ui
