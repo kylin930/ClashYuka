@@ -1,0 +1,34 @@
+# Build output
+out/
+build/
+cmake-build-*/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# Machine specific preset with local absolute paths
+CMakeUserPresets.json
+
+# Local test artifacts, secrets and proxy settings
+*.local.yaml
+*.secret
+*.log
+
+# Visual Studio
+.vs/
+*.sln
+*.slnx
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
