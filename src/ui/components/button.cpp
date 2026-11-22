@@ -260,7 +260,7 @@ void Button::PaintContent(Painter& painter, const wxSize& size) {
     }
 
     const wxFont font = Font(TypeStyle::Label);
-    const wxSize textSize = painter.MeasureText(label_.ToStdString(), font);
+    const wxSize textSize = painter.MeasureText(label_.utf8_string(), font);
     const int iconSize = FromDIP(kIconSizeDp);
     const int gap = icon_.has_value() ? FromDIP(kIconGapDp) : 0;
     const int contentWidth = textSize.x + (icon_.has_value() ? iconSize + gap : 0);
@@ -274,7 +274,7 @@ void Button::PaintContent(Painter& painter, const wxSize& size) {
         textX += iconSize + gap;
     }
 
-    painter.DrawText(label_.ToStdString(),
+    painter.DrawText(label_.utf8_string(),
                      wxRect(textX, drawRect.y, drawRect.x + drawRect.width - textX,
                             drawRect.height),
                      font, foreground, wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);

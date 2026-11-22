@@ -1,6 +1,6 @@
 # ClashYuka
 
-基于 Mihomo 的轻量级原生桌面代理客户端。当前完成 P0（工程基础）、P1（Mihomo Core 集成与通信层）、P2.0（MD3 自绘 UI 系统）与 P2.0.1（Material Motion 打磨）。
+基于 Mihomo 的轻量级原生桌面代理客户端。当前完成 P0（工程基础）、P1（Mihomo Core 集成与通信层）、P2.0（MD3 自绘 UI 系统）、P2.0.1（Material Motion 打磨）与 P2.1（原生应用框架）。
 
 ## 技术栈
 
@@ -15,8 +15,12 @@
 | --- | --- | --- |
 | MD3 主题令牌 | `include/clashyuka/ui/theme` | 4 套配色 × Light/Dark、字体、圆角、间距、DPI |
 | 绘制层 | `include/clashyuka/ui/drawing` | Painter、矢量图标、统一动画管理器、MotionTokens、Ripple |
-| 组件库 | `include/clashyuka/ui/components` | Card/Button/IconButton/Switch/ListItem/Rail/Tab/Dialog/Snackbar/Progress |
-| Demo | `include/clashyuka/ui/demo_frame.h`, `src/ui/demo_frame.cpp` | 组件展示与主题切换 |
+| 组件库 | `include/clashyuka/ui/components` | Card/Button/IconButton/Switch/ListItem/Rail/Tab/Dialog/Snackbar/Progress/SearchField |
+| 应用状态 | `include/clashyuka/app/app_state.h` | `AppStateSnapshot`、内核/API/页面/主题/代理模式等状态与观察者 |
+| 应用控制器 | `include/clashyuka/app/app_controller.h` | 导航、主题偏好、Snackbar/Dialog 入口与 P2.2 状态上报钩子 |
+| 页面注册 | `include/clashyuka/app/page_registry.h` | 6 个页面的标题、描述、图标与延迟创建 |
+| 主窗口 | `include/clashyuka/ui/main_window.h` | NavigationRail、顶部标题栏、页面容器、底部状态栏 |
+| 应用页面 | `include/clashyuka/ui/pages` | Overview / Proxies / Connections / Profiles / Logs / Settings |
 | 数据模型与 JSON 解析 | `include/clashyuka/mihomo/types.h`, `src/mihomo/json.cpp` | 容错解析，未知字段/类型不匹配不会导致崩溃 |
 | 统一错误 | `include/clashyuka/core/result.h` | `ErrorKind` + `Result<T>`，不向调用方暴露 httplib/nlohmann 异常 |
 | REST 客户端 | `include/clashyuka/mihomo/api_client.h` | 每次请求独立连接，可跨线程使用 |
@@ -102,21 +106,30 @@ Windows 停止流程：GUI 进程无控制台时先 `AttachConsole` 并向子进
 
 关闭动画或开启 Reduced Motion 时，所有动画立即到达最终状态，交互与状态仍然可用；不执行 Ripple、缩放、位移与旋转。
 
-Demo 窗口（`ClashYuka.exe`）快捷键：
+## 应用框架（P2.1）
 
-| 快捷键 | 作用 |
-| --- | --- |
-| F1 / F2 / F3 / F4 / F5 | Overview / Components / Feedback / Motion / About |
-| Ctrl+1..4 | Purple / Blue / Teal / Orange |
-| Ctrl+D | 切换深色模式 |
-| Ctrl+M / Ctrl+R | 开关动画 / Reduced Motion |
-| Ctrl+T | 切换组件页 Tab |
-| Ctrl+S | 显示 Snackbar |
-| Ctrl+E | 显示 Dialog |
+启动 `ClashYuka.exe` 后进入真正的客户端主界面，不再加载组件 Demo：
 
-Motion 页面提供动画开关、Reduced Motion、按钮/图标按钮按压、Switch、进度与 Snackbar 的直接演示。
+- 左侧 NavigationRail：Dashboard / Proxies / Connections / Profiles / Logs / Settings，窗口窄于 1000 DIP 时自动折叠为图标栏
+- 顶部：页面标题、描述与全局设置入口
+- 中部：可滚动的页面容器，页面按需创建并保留状态
+- 底部状态栏：内核状态、API 连接状态、Mihomo 版本与代理模式，全部来自 AppState（当前为 Not started / Disconnected / Unknown）
+- 页面切换使用轻量上滑动画，NavigationRail 指示器同步移动
 
-界面截图位于 `docs/screenshots/`：主题（`theme-*.png`）、Dialog、Snackbar、Motion 页（`motion-page.png`、`release-motion.png`）、动画关闭（`animations-off.png`）、Reduced Motion（`reduced-motion.png`）、组件状态（`button-ripple.png`、`switch-states.png`、`rail-selected.png`、`tab-indicator.png`）。
+架构要点：
+
+- `AppController` 是导航、主题偏好和消息入口的唯一协调者；页面不直接访问 Mihomo 或全局状态
+- `AppState` 保存快照并通过观察者同步通知，通知使用快照副本，允许观察者在回调中订阅或退订
+- 页面通过 `PageBase` 注册观察者，只读状态并用现有 MD3 组件渲染
+- 所有 Mock/占位内容均显式标注（Demo data / Not implemented / P2.2），未实现的操作只打开说明 Dialog，不伪造成功
+- Proxies / Connections / Logs / Profiles 的搜索、筛选、展开、清空等交互在本地演示数据上真实生效；节点切换、订阅、日志流等业务留待后续阶段
+
+界面截图位于 `docs/screenshots/`：
+
+- 页面：`p21-overview-light.png`、`p21-overview-dark.png`、`p21-proxies.png`、`p21-connections.png`、`p21-profiles.png`、`p21-logs.png`、`p21-settings.png`、`p21-settings-scrolled.png`
+- 主题：`p21-theme-purple.png`、`p21-theme-blue.png`、`p21-theme-teal.png`、`p21-theme-orange.png`
+- 交互状态：`p21-animations-off.png`、`p21-reduced-motion.png`、`p21-dialog.png`、`p21-snackbar.png`
+- 窗口缩放：`p21-window-narrow.png`、`p21-window-restored.png`
 
 ## 平台状态
 
@@ -164,10 +177,11 @@ ctest --preset windows-x64-release --output-on-failure
 ctest --preset windows-x64-debug --output-on-failure
 ```
 
-包含三个 CTest 目标：
+包含四个 CTest 目标：
 
 - `clashyuka_tests`：数据模型/JSON、URL 编码、Mock HTTP（鉴权、PUT、错误、超时）、Mock WebSocket（收发、异常消息、主动断开、重连、析构清理）
 - `clashyuka_ui_tests`：主题/DPI/形状令牌、缓动函数端点与单调性、Bezier 插值、动画中途改目标、动画取消与 Handle 析构、多动画并行
+- `clashyuka_app_tests`：AppState 默认值/通知去重、观察者增删与通知期间订阅、AppController 导航/主题同步/消息转发、页面注册表顺序与查找
 - `clashyuka_process_tests`：进程启动、输出捕获、退出码、重复启动/停止、重启、非法路径
 
 真实内核验证不注册进 CTest（需要外部 mihomo）：

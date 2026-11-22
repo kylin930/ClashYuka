@@ -217,9 +217,9 @@ void ListItem::PaintContent(Painter& painter, const wxSize& size) {
     int trailingWidth = 0;
     if (!trailingText_.empty()) {
         const wxFont font = Font(TypeStyle::Label);
-        const wxSize textSize = painter.MeasureText(trailingText_.ToStdString(), font);
+        const wxSize textSize = painter.MeasureText(trailingText_.utf8_string(), font);
         trailingWidth = textSize.x + FromDIP(12);
-        painter.DrawText(trailingText_.ToStdString(),
+        painter.DrawText(trailingText_.utf8_string(),
                          wxRect(size.x - padding - trailingWidth, 0, trailingWidth, size.y), font,
                          WithAlpha(accent, 170), wxALIGN_RIGHT | wxALIGN_CENTER_VERTICAL);
     }
@@ -234,15 +234,15 @@ void ListItem::PaintContent(Painter& painter, const wxSize& size) {
 
     const int textWidth = std::max(0, size.x - textX - padding - trailingWidth);
     if (subtitle_.empty()) {
-        painter.DrawText(title_.ToStdString(), wxRect(textX, 0, textWidth, size.y),
+        painter.DrawText(title_.utf8_string(), wxRect(textX, 0, textWidth, size.y),
                          Font(TypeStyle::Body), base,
                          wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);
     } else {
         const int top = FromDIP(12);
-        painter.DrawText(title_.ToStdString(), wxRect(textX, top, textWidth, FromDIP(24)),
+        painter.DrawText(title_.utf8_string(), wxRect(textX, top, textWidth, FromDIP(24)),
                          Font(TypeStyle::Body), base,
                          wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);
-        painter.DrawText(subtitle_.ToStdString(),
+        painter.DrawText(subtitle_.utf8_string(),
                          wxRect(textX, top + FromDIP(24), textWidth, FromDIP(20)),
                          Font(TypeStyle::Label), WithAlpha(accent, 170),
                          wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);

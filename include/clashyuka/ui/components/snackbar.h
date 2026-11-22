@@ -19,6 +19,8 @@ public:
     ~Snackbar() override;
 
     void Dismiss();
+    // Bottom margin in DIP, so the shell can keep snackbars above a status bar.
+    void SetBottomInset(int insetDp);
     // Reuses the visible snackbar instead of stacking a second one.
     void ReplaceMessage(const wxString& message, const wxString& actionLabel,
                         std::function<void()> onAction, int durationMs);
@@ -43,6 +45,7 @@ private:
     wxString actionLabel_;
     std::function<void()> onAction_;
     int durationMs_;
+    int bottomInsetDp_ = 16;
     bool closing_ = false;
     double offsetY_ = 0.0;
     double opacity_ = 0.0;

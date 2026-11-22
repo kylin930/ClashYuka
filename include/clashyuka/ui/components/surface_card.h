@@ -25,10 +25,12 @@ public:
     void SetContent(wxSizer* content, int paddingDp = -1);
     void SetOnClick(std::function<void()> handler);
 
+    // Children that paint their own background inherit this colour.
+    Color CardColor() const;
+
     void OnThemeChanged() override;
 
 private:
-    Color CardColor() const;
     void OnPaint(wxPaintEvent& event);
     void UpdateHover(double target);
     void UpdatePress(double target);

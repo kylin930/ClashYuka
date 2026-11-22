@@ -2,6 +2,8 @@
 
 #include <wx/dcbuffer.h>
 
+#include "clashyuka/ui/components/surface_card.h"
+
 namespace clashyuka::ui {
 
 ControlBase::ControlBase(wxWindow* parent, wxWindowID id, const wxPoint& pos,
@@ -41,7 +43,16 @@ wxFont ControlBase::Font(TypeStyle style) const {
 
 void ControlBase::OnPaint(wxPaintEvent&) {
     wxAutoBufferedPaintDC dc(this);
-    dc.SetBackground(wxBrush(ToWx(paintOpaque_ ? surface_ : Colors().surface)));
+    Color background = paintOpaque_ ? surface_ : Colors().surface;
+    if (!customSurface_) {
+        // Rows and labels placed on a SurfaceCard must use the card colour;
+        // child windows cannot show the parent surface through themselves.
+        // Use C++ RTTI: SurfaceCard has no wxWidgets dynamic-class macros.
+        if (auto* card = dynamic_cast<SurfaceCard*>(GetParent())) {
+            background = card->CardColor();
+        }
+    }
+    dc.SetBackground(wxBrush(ToWx(background)));
     dc.Clear();
     auto gc = CreateGraphicsContext(dc);
     if (!gc) {

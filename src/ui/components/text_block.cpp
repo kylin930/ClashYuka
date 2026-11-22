@@ -34,7 +34,7 @@ wxSize TextBlock::DoGetBestClientSize() const {
 
 void TextBlock::PaintContent(Painter& painter, const wxSize& size) {
     const auto alpha = static_cast<std::uint8_t>(alpha_ * contentAlpha_);
-    painter.DrawText(text_.ToStdString(), wxRect(0, 0, size.x, size.y), Font(style_),
+    painter.DrawText(text_.utf8_string(), wxRect(0, 0, size.x, size.y), Font(style_),
                      WithAlpha(Colors().onSurface, alpha),
                      wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);
 }

@@ -122,6 +122,12 @@ void Snackbar::ReplaceMessage(const wxString& message, const wxString& actionLab
     Refresh();
 }
 
+void Snackbar::SetBottomInset(int insetDp) {
+    bottomInsetDp_ = std::max(0, insetDp);
+    Reposition();
+    Refresh();
+}
+
 void Snackbar::Reposition() {
     if (parentWindow_ == nullptr) {
         return;
@@ -129,7 +135,7 @@ void Snackbar::Reposition() {
     const wxSize parentSize = parentWindow_->GetClientSize();
     const wxSize size = GetSize();
     const int x = (parentSize.x - size.x) / 2;
-    const int y = parentSize.y - size.y - FromDIP(SpaceDp(Space::Lg)) +
+    const int y = parentSize.y - size.y - FromDIP(bottomInsetDp_) +
                   static_cast<int>(offsetY_);
     SetPosition(wxPoint(std::max(0, x), std::max(0, y)));
 }
@@ -194,9 +200,9 @@ void Snackbar::PaintContent(Painter& painter, const wxSize& size) {
     const wxFont font = Font(TypeStyle::Label);
     int actionWidth = 0;
     if (!actionLabel_.empty()) {
-        actionWidth = painter.MeasureText(actionLabel_.ToStdString(), font).x;
+        actionWidth = painter.MeasureText(actionLabel_.utf8_string(), font).x;
         actionRect_ = wxRect(closeRect_.x - FromDIP(12) - actionWidth, 0, actionWidth, size.y);
-        painter.DrawText(actionLabel_.ToStdString(), actionRect_, font,
+        painter.DrawText(actionLabel_.utf8_string(), actionRect_, font,
                          WithAlpha(colors.inversePrimary, opacity),
                          wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);
     } else {
@@ -204,7 +210,7 @@ void Snackbar::PaintContent(Painter& painter, const wxSize& size) {
     }
 
     const int messageRight = (actionWidth > 0 ? actionRect_.x : closeRect_.x) - FromDIP(12);
-    painter.DrawText(message_.ToStdString(), wxRect(padding, 0, messageRight - padding, size.y),
+    painter.DrawText(message_.utf8_string(), wxRect(padding, 0, messageRight - padding, size.y),
                      font, WithAlpha(colors.inverseOnSurface, opacity),
                      wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);
     IconProvider::Draw(painter, IconId::Close, closeRect_,

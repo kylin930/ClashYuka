@@ -135,6 +135,7 @@ add_library(clashyuka_ui STATIC
   src/ui/components/snackbar.cpp
   src/ui/components/progress_indicator.cpp
   src/ui/components/text_block.cpp
+  src/ui/components/search_field.cpp
 )
 target_include_directories(clashyuka_ui PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -146,10 +147,37 @@ if(MSVC)
 endif()
 target_link_libraries(clashyuka_ui PUBLIC clashyuka_options ${wxWidgets_LIBRARIES})
 
+# --- Application shell (state, controller, pages, main window) --------------
+add_library(clashyuka_app STATIC
+  src/app/app_state.cpp
+  src/app/app_controller.cpp
+  src/app/page_registry.cpp
+  src/ui/main_window.cpp
+  src/ui/pages/page_base.cpp
+  src/ui/pages/overview_page.cpp
+  src/ui/pages/proxies_page.cpp
+  src/ui/pages/connections_page.cpp
+  src/ui/pages/profiles_page.cpp
+  src/ui/pages/logs_page.cpp
+  src/ui/pages/settings_page.cpp
+)
+target_include_directories(clashyuka_app PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${wxWidgets_INCLUDE_DIRS}
+)
+target_compile_definitions(clashyuka_app PUBLIC ${wxWidgets_DEFINITIONS})
+if(MSVC)
+  target_compile_definitions(clashyuka_app PUBLIC _CRT_SECURE_NO_WARNINGS)
+endif()
+target_link_libraries(clashyuka_app PUBLIC
+  clashyuka_core
+  clashyuka_ui
+  ${wxWidgets_LIBRARIES}
+)
+
 add_executable(ClashYuka WIN32
   src/main.cpp
   src/app/app.cpp
-  src/ui/demo_frame.cpp
 )
 target_include_directories(ClashYuka PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -160,6 +188,7 @@ if(MSVC)
   target_compile_definitions(ClashYuka PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 target_link_libraries(ClashYuka PRIVATE
+  clashyuka_app
   clashyuka_core
   clashyuka_mihomo
   clashyuka_process
@@ -197,6 +226,13 @@ if(CLASHYUKA_BUILD_TESTS)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   add_test(NAME clashyuka_ui_tests COMMAND clashyuka_ui_tests)
+
+  add_executable(clashyuka_app_tests tests/test_app.cpp)
+  target_link_libraries(clashyuka_app_tests PRIVATE clashyuka_app doctest::doctest)
+  set_target_properties(clashyuka_app_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  add_test(NAME clashyuka_app_tests COMMAND clashyuka_app_tests)
 
   add_executable(clashyuka_process_probe tests/helpers/process_probe.cpp)
   set_target_properties(clashyuka_process_probe PROPERTIES
