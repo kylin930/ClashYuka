@@ -8,7 +8,6 @@
 #include <type_traits>
 
 #include "clashyuka/core/app_info.h"
-#include "clashyuka/network/mihomo_client.h"
 #include "clashyuka/platform/platform_services.h"
 
 TEST_CASE("platform services report the build platform") {
@@ -56,9 +55,4 @@ TEST_CASE("cpp-httplib exposes HTTP and WebSocket clients") {
 
     httplib::Client client("127.0.0.1", 9090);
     CHECK(client.host() == "127.0.0.1");
-}
-
-TEST_CASE("mihomo client builds the external controller endpoint") {
-    const clashyuka::network::MihomoClient client("127.0.0.1", 9090);
-    CHECK(client.Endpoint() == "http://127.0.0.1:9090");
 }

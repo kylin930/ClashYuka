@@ -1,4 +1,4 @@
-{
+﻿{
   "version": 6,
   "cmakeMinimumRequired": {
     "major": 3,
@@ -11,7 +11,6 @@
       "hidden": true,
       "displayName": "Windows x64 (MSVC, Ninja Multi-Config)",
       "generator": "Ninja Multi-Config",
-      "binaryDir": "${sourceDir}/out/build/windows-x64",
       "architecture": {
         "value": "x64",
         "strategy": "external"
@@ -31,7 +30,14 @@
     {
       "name": "windows-x64",
       "inherits": "windows-base",
-      "displayName": "Windows x64"
+      "displayName": "Windows x64 (CLI)",
+      "binaryDir": "${sourceDir}/out/build/windows-x64"
+    },
+    {
+      "name": "windows-vs-base",
+      "hidden": true,
+      "inherits": "windows-base",
+      "binaryDir": "${sourceDir}/out/build/vs/windows-x64"
     },
     {
       "name": "macos",
