@@ -89,6 +89,8 @@ TEST_CASE("process refuses duplicate starts and stops idempotently") {
     process.Stop();
     CHECK_FALSE(process.IsRunning());
     CHECK_FALSE(process.GetPid().has_value());
+    const auto stoppedCode = process.GetExitCode();
+    CHECK(stoppedCode.has_value());
 
     process.Stop();
     CHECK_FALSE(process.IsRunning());

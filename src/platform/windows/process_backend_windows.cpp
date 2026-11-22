@@ -106,6 +106,22 @@ bool CreatePipePair(HANDLE& readHandle, HANDLE& writeHandle) {
     return true;
 }
 
+// Console control events only reach processes attached to the same console.
+// This is intentionally limited to GUI processes without a console, so a
+// CTRL_BREAK can never leak into the user's terminal.
+bool RequestConsoleBreak(DWORD pid) {
+    if (::GetConsoleWindow() != nullptr) {
+        return false;
+    }
+    if (::AttachConsole(pid) == FALSE) {
+        return false;
+    }
+    ::SetConsoleCtrlHandler(nullptr, TRUE);
+    const BOOL sent = ::GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0);
+    ::FreeConsole();
+    return sent != FALSE;
+}
+
 class WindowsProcessBackend final : public ProcessBackend {
 public:
     ~WindowsProcessBackend() override { Stop(); }
@@ -143,7 +159,8 @@ public:
         std::string command = BuildCommandLine(options);
         PROCESS_INFORMATION processInfo{};
         const BOOL created = ::CreateProcessA(
-            nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+            nullptr, command.data(), nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr,
             &startup, &processInfo);
 
         CloseHandleSafely(stdoutWrite);
@@ -199,7 +216,15 @@ public:
         }
 
         if (running_.load()) {
-            ::TerminateProcess(process_, 1);
+            // Ask the kernel to exit cooperatively first. Only a GUI process
+            // without a console attempts this, so the event cannot affect the
+            // user's terminal or unrelated processes.
+            if (RequestConsoleBreak(pid_)) {
+                ::WaitForSingleObject(process_, 3000);
+            }
+            if (running_.load()) {
+                ::TerminateProcess(process_, 1);
+            }
         }
         ::WaitForSingleObject(process_, kStopTimeoutMs);
         running_.store(false);
