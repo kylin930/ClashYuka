@@ -43,6 +43,7 @@ struct KernelSession::SharedState {
     core::Error error;
     std::string eventError;
     KernelSessionObserver* observer = nullptr;
+    mihomo::MihomoApiConfig apiConfig;
 };
 
 const char* KernelPhaseName(KernelPhase phase) {
@@ -111,6 +112,11 @@ KernelSnapshot KernelSession::Snapshot() const {
     snapshot.error = state_->error;
     snapshot.eventError = state_->eventError;
     return snapshot;
+}
+
+mihomo::MihomoApiConfig KernelSession::ApiConfig() const {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->apiConfig;
 }
 
 void KernelSession::Start() {
@@ -366,6 +372,10 @@ void KernelSession::HandleStart(std::uint64_t generation) {
     apiConfig.readTimeoutMs = options.readinessTimeoutMs;
     apiConfig.kernelRunningProbe = [this] { return process_ && process_->IsRunning(); };
     api_ = drivers_->CreateApi(apiConfig);
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->apiConfig = apiConfig;
+    }
 
     mihomo::MihomoLaunchOptions launch;
     launch.executablePath = options.executablePath;

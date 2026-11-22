@@ -26,10 +26,16 @@ struct ApiFixture {
     std::atomic<bool> invalidJsonVersion{false};
     std::atomic<bool> slowVersion{false};
     std::atomic<bool> emptyProxies{false};
+    std::atomic<bool> delayTimeout{false};
+    std::atomic<bool> delayInvalid{false};
     std::mutex mutex;
     std::string lastSelectPath;
     std::string lastSelectBody;
     std::string lastPatchBody;
+    std::string lastDelayTarget;
+    std::string lastDelayUrl;
+    std::string lastDelayTimeout;
+    std::string lastDeleteTarget;
 
     bool Start() {
         auto& srv = server.server();
@@ -74,6 +80,32 @@ struct ApiFixture {
                 "application/json");
         });
 
+        // Register the more specific delay route before the generic proxy route.
+        srv.Get(R"(/proxies/(.+)/delay)",
+                [this](const httplib::Request& request, httplib::Response& response) {
+                    if (!HasValidBearer(request)) {
+                        response.status = 401;
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        const std::size_t query = request.target.find('?');
+                        lastDelayTarget = request.target.substr(0, query);
+                        lastDelayUrl = request.get_param_value("url");
+                        lastDelayTimeout = request.get_param_value("timeout");
+                    }
+                    if (delayTimeout.load()) {
+                        response.status = 504;
+                        response.set_content("timeout", "text/plain");
+                        return;
+                    }
+                    if (delayInvalid.load()) {
+                        response.set_content(R"({"no-delay":true})", "application/json");
+                        return;
+                    }
+                    response.set_content(R"({"delay":123})", "application/json");
+                });
+
         srv.Get(R"(/proxies/(.+))",
                 [this](const httplib::Request& request, httplib::Response& response) {
                     if (!HasValidBearer(request)) {
@@ -88,6 +120,19 @@ struct ApiFixture {
                     })",
                         "application/json");
                 });
+
+        srv.Delete(R"(/proxies/(.+))",
+                   [this](const httplib::Request& request, httplib::Response& response) {
+                       if (!HasValidBearer(request)) {
+                           response.status = 401;
+                           return;
+                       }
+                       {
+                           std::lock_guard<std::mutex> lock(mutex);
+                           lastDeleteTarget = request.target;
+                       }
+                       response.status = 204;
+                   });
 
         srv.Put(R"(/proxies/(.+))",
                 [this](const httplib::Request& request, httplib::Response& response) {
@@ -333,4 +378,46 @@ TEST_CASE("Mihomo API client rejects a wildcard controller host") {
     auto result = client.GetVersion();
     REQUIRE_FALSE(result);
     CHECK(result.error().kind == core::ErrorKind::InvalidConfig);
+}
+
+TEST_CASE("Mihomo API client encodes delay tests and maps timeout responses") {
+    ApiFixture fixture;
+    REQUIRE(fixture.Start());
+    mihomo::MihomoApiClient client(fixture.Config());
+
+    const std::string testUrl = "https://example.com/a?b=1&c=2";
+    auto delay = client.TestProxyDelay("香港 #1 %", testUrl, 5000);
+    REQUIRE(delay);
+    CHECK(delay.value() == 123);
+
+    {
+        std::lock_guard<std::mutex> lock(fixture.mutex);
+        CHECK(fixture.lastDelayTarget ==
+              "/proxies/%E9%A6%99%E6%B8%AF%20%231%20%25/delay");
+        CHECK(fixture.lastDelayUrl == testUrl);
+        CHECK(fixture.lastDelayTimeout == "5000");
+    }
+
+    fixture.delayTimeout.store(true);
+    auto timedOut = client.TestProxyDelay("node", "https://example.com", 5000);
+    REQUIRE_FALSE(timedOut);
+    CHECK(timedOut.error().kind == core::ErrorKind::Timeout);
+
+    fixture.delayTimeout.store(false);
+    fixture.delayInvalid.store(true);
+    auto invalid = client.TestProxyDelay("node", "https://example.com", 5000);
+    REQUIRE_FALSE(invalid);
+    CHECK(invalid.error().kind == core::ErrorKind::MissingField);
+}
+
+TEST_CASE("Mihomo API client clears a fixed selection with an encoded DELETE") {
+    ApiFixture fixture;
+    REQUIRE(fixture.Start());
+    mihomo::MihomoApiClient client(fixture.Config());
+
+    auto cleared = client.ClearProxySelection("Auto 组/#1");
+    REQUIRE(cleared);
+
+    std::lock_guard<std::mutex> lock(fixture.mutex);
+    CHECK(fixture.lastDeleteTarget == "/proxies/Auto%20%E7%BB%84%2F%231");
 }

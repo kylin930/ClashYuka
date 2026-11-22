@@ -9,6 +9,10 @@ namespace clashyuka::mihomo {
 // kept, everything else including '/' is escaped).
 std::string EncodePathSegment(std::string_view segment);
 
+// Percent-encodes a query component. Spaces become %20 so the value survives
+// proxies and servers that do not treat '+' as a space.
+std::string EncodeQueryComponent(std::string_view value);
+
 // Hosts that cannot be used as a request target.
 bool IsWildcardAddress(std::string_view host);
 

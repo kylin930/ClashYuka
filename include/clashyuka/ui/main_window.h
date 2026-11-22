@@ -36,6 +36,8 @@ public:
 
     void ShowMessage(const wxString& message) override;
     void ShowInfoDialog(const wxString& title, const wxString& body) override;
+    bool ShowConfirmDialog(const wxString& title, const wxString& body,
+                           const wxString& confirmLabel) override;
 
     void OnAppStateChanged(const app::AppStateSnapshot& state) override;
     void OnThemeChanged() override;

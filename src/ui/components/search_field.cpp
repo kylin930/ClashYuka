@@ -63,7 +63,9 @@ wxString SearchField::GetValue() const {
 void SearchField::SetValue(const wxString& value) {
     if (input_ != nullptr) {
         input_->ChangeValue(value);
+        input_->Refresh();
     }
+    Refresh();
 }
 
 void SearchField::Clear() {

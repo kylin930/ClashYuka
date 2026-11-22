@@ -73,6 +73,8 @@ TEST_CASE("proxy group JSON parsing") {
         "type": "Selector",
         "now": "DIRECT",
         "all": ["DIRECT", "香港 01"],
+        "fixed": "香港 01",
+        "provider-name": "provider-a",
         "hidden": false,
         "history": []
     })");
@@ -81,8 +83,19 @@ TEST_CASE("proxy group JSON parsing") {
     REQUIRE(parsed);
     CHECK(parsed.value().is_group());
     CHECK(parsed.value().now == "DIRECT");
+    CHECK(parsed.value().fixed == "香港 01");
+    CHECK(parsed.value().providerName == "provider-a");
     REQUIRE(parsed.value().all.size() == 2);
     CHECK(parsed.value().all[1] == "香港 01");
+
+    const auto balance = json::parse(R"({
+        "name": "Balance", "type": "LoadBalance", "all": ["A", "B"]
+    })");
+    auto parsedBalance = mihomo::ParseProxyInfo(balance);
+    REQUIRE(parsedBalance);
+    CHECK(parsedBalance.value().is_group());
+    CHECK(parsedBalance.value().now.empty());
+    CHECK(parsedBalance.value().fixed.empty());
 }
 
 TEST_CASE("proxy collection tolerates malformed entries and unknown types") {

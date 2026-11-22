@@ -60,6 +60,8 @@ core::Result<std::string> Request(const MihomoApiConfig& config, const char* met
         result = client.Put(path, body, content_type == nullptr ? "application/json" : content_type);
     } else if (verb == "PATCH") {
         result = client.Patch(path, body, content_type == nullptr ? "application/json" : content_type);
+    } else if (verb == "DELETE") {
+        result = client.Delete(path);
     } else {
         return MakeError(ErrorKind::Internal, "unsupported HTTP method " + verb);
     }
@@ -176,6 +178,41 @@ core::Result<void> MihomoApiClient::SelectProxy(std::string_view group,
         return response.error();
     }
     return {};
+}
+
+core::Result<void> MihomoApiClient::ClearProxySelection(std::string_view group) const {
+    auto response = Request(impl_->config, "DELETE", "/proxies/" + EncodePathSegment(group));
+    if (!response) {
+        return response.error();
+    }
+    return {};
+}
+
+core::Result<int> MihomoApiClient::TestProxyDelay(std::string_view name, std::string_view url,
+                                                  int timeoutMs) const {
+    if (url.empty()) {
+        return MakeError(ErrorKind::InvalidConfig, "delay test URL must not be empty");
+    }
+    if (timeoutMs <= 0 || timeoutMs > 60000) {
+        return MakeError(ErrorKind::InvalidConfig, "delay test timeout is out of range");
+    }
+    const std::string path = "/proxies/" + EncodePathSegment(name) + "/delay?url=" +
+                             EncodeQueryComponent(url) + "&timeout=" +
+                             std::to_string(timeoutMs);
+    auto json = RequestJson(impl_->config, "GET", path);
+    if (!json) {
+        core::Error error = json.error();
+        if (error.httpStatus == 408 || error.httpStatus == 504) {
+            error.kind = ErrorKind::Timeout;
+            error.message = "delay test timed out";
+        }
+        return error;
+    }
+    const auto it = json.value().find("delay");
+    if (it == json.value().end() || !it->is_number()) {
+        return MakeError(ErrorKind::MissingField, "delay response has no numeric 'delay'");
+    }
+    return static_cast<int>(it->get<double>());
 }
 
 core::Result<RuntimeConfiguration> MihomoApiClient::GetConfigs() const {

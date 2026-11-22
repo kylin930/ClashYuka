@@ -8,6 +8,7 @@
 #include <wx/stdpaths.h>
 
 #include "clashyuka/app/app_text.h"
+#include "clashyuka/app/archive_extractor.h"
 #include "clashyuka/core/timing.h"
 #include "clashyuka/ui/theme/theme_manager.h"
 
@@ -35,6 +36,16 @@ std::string FormatAddress(const std::string& host, int port) {
         return "[" + host + "]:" + std::to_string(port);
     }
     return host + ":" + std::to_string(port);
+}
+
+std::function<void(std::function<void()>)> MakeUiDispatcher() {
+    return [](std::function<void()> task) {
+        if (wxTheApp != nullptr) {
+            wxTheApp->CallAfter(std::move(task));
+        } else {
+            task();
+        }
+    };
 }
 
 KernelState MapKernelPhase(runtime::KernelPhase phase) {
@@ -165,15 +176,10 @@ void AppController::InitializeRuntime() {
     state_.SetKernelError("");
 
     kernel_ = std::make_unique<runtime::KernelSession>(
-        runtime::CreateDefaultDriverFactory(), [](std::function<void()> task) {
-            if (wxTheApp != nullptr) {
-                wxTheApp->CallAfter(std::move(task));
-            } else {
-                task();
-            }
-        });
+        runtime::CreateDefaultDriverFactory(), MakeUiDispatcher());
     kernel_->SetOptions(BuildKernelOptions());
     kernel_->SetObserver(this);
+    CreateInstaller();
     runtimeInitialized_ = true;
 
     if (!loaded.warning.empty()) {
@@ -187,6 +193,9 @@ void AppController::InitializeRuntime() {
 }
 
 void AppController::ShutdownRuntime() {
+    StopInstallerThread();
+    installer_.reset();
+    DestroyProxyService();
     if (!kernel_) {
         runtimeInitialized_ = false;
         return;
@@ -286,6 +295,12 @@ bool AppController::SaveKernelSettings(const runtime::AppSettings& settings, wxS
     if (kernel_) {
         kernel_->SetOptions(BuildKernelOptions());
     }
+    if (proxyService_) {
+        proxyService_->SetTestSettings(settings_.proxyTestUrl, settings_.proxyTestTimeoutMs);
+    }
+    if (!installerBusy_) {
+        CreateInstaller();
+    }
     return true;
 }
 
@@ -307,8 +322,11 @@ void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
         case runtime::KernelPhase::Running:
             state_.SetProfile("Built-in Runtime Config", true);
             state_.SetKernelError("");
+            CreateProxyService();
             break;
         case runtime::KernelPhase::Failed: {
+            DestroyProxyService();
+            state_.SetProxyCatalog(nullptr);
             state_.SetProfile("", false);
             state_.SetTraffic(0.0, 0.0, false);
             state_.SetConnectionCount(0);
@@ -325,6 +343,8 @@ void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
             break;
         }
         case runtime::KernelPhase::Stopped:
+            DestroyProxyService();
+            state_.SetProxyCatalog(nullptr);
             state_.SetProfile("", false);
             state_.SetTraffic(0.0, 0.0, false);
             state_.SetConnectionCount(0);
@@ -355,6 +375,464 @@ void AppController::OnKernelTraffic(double uploadBytesPerSecond,
 
 void AppController::OnKernelConnections(int count) {
     state_.SetConnectionCount(count);
+}
+
+void AppController::CreateProxyService() {
+    if (proxyService_ || !kernel_ || kernel_->Phase() != runtime::KernelPhase::Running) {
+        return;
+    }
+    const mihomo::MihomoApiConfig config = kernel_->ApiConfig();
+    if (config.port <= 0 || config.port > 65535) {
+        return;
+    }
+    proxyService_ = std::make_unique<runtime::ProxyService>(
+        runtime::CreateMihomoProxyApi(config), MakeUiDispatcher(), settings_.proxyTestUrl,
+        settings_.proxyTestTimeoutMs);
+    proxyService_->SetObserver(this);
+    proxyService_->Refresh();
+}
+
+void AppController::DestroyProxyService() {
+    if (!proxyService_) {
+        return;
+    }
+    proxyService_->SetObserver(nullptr);
+    proxyService_->Shutdown();
+    proxyService_.reset();
+}
+
+void AppController::RefreshProxies() {
+    if (!proxyService_) {
+        ShowMessage("Start the Mihomo kernel to load proxy groups.");
+        return;
+    }
+    proxyService_->Refresh();
+}
+
+void AppController::SelectProxy(std::string group, std::string target) {
+    if (!proxyService_) {
+        return;
+    }
+    proxyService_->Select(std::move(group), std::move(target));
+}
+
+void AppController::ClearProxySelection(std::string group) {
+    if (!proxyService_) {
+        return;
+    }
+    proxyService_->ClearSelection(std::move(group));
+}
+
+void AppController::TestProxyDelay(std::string name) {
+    if (!proxyService_ || name.empty()) {
+        return;
+    }
+    proxyService_->TestDelay(std::move(name));
+}
+
+void AppController::TestGroupDelays(std::vector<std::string> names) {
+    if (!proxyService_) {
+        return;
+    }
+    proxyService_->TestGroup(std::move(names));
+}
+
+void AppController::CancelProxyTests() {
+    if (proxyService_) {
+        proxyService_->CancelTests();
+    }
+}
+
+void AppController::OnProxyCatalog(const std::shared_ptr<const runtime::ProxyCatalog>& catalog) {
+    state_.SetProxyCatalog(catalog);
+    if (catalog && !catalog->error.empty() &&
+        catalog->generation != lastShownProxyError_) {
+        lastShownProxyError_ = catalog->generation;
+        ShowMessage(wxString::FromUTF8("Proxy data: " + catalog->error));
+    }
+}
+
+void AppController::CreateInstaller() {
+    if (installerBusy_) {
+        return;
+    }
+    installRoot_ = settings_.kernelInstallDir.empty()
+                       ? runtime::DefaultKernelInstallRoot(settingsDirectory_)
+                       : settings_.kernelInstallDir;
+    runtime::KernelInstallOptions options;
+    options.installRoot = installRoot_;
+    options.downloadProxy = settings_.downloadProxy;
+    installer_ = std::make_unique<runtime::KernelInstaller>(
+        runtime::CreatePlatformKernelTransport(), app::CreateWxArchiveExtractor(),
+        std::move(options));
+}
+
+void AppController::PostToUi(std::function<void()> task) {
+    if (!task) {
+        return;
+    }
+    MakeUiDispatcher()(std::move(task));
+}
+
+void AppController::PublishKernelUpdate(
+    const std::function<void(runtime::KernelUpdateSnapshot&)>& mutate) {
+    std::shared_ptr<runtime::KernelUpdateSnapshot> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(installerMutex_);
+        if (!updateSnapshot_) {
+            updateSnapshot_ = std::make_shared<runtime::KernelUpdateSnapshot>();
+        }
+        snapshot = std::make_shared<runtime::KernelUpdateSnapshot>(*updateSnapshot_);
+        mutate(*snapshot);
+        updateSnapshot_ = snapshot;
+    }
+    PostToUi([this, snapshot] { state_.SetKernelUpdate(snapshot); });
+}
+
+void AppController::StartInstallerThread(std::function<void()> task) {
+    bool expected = false;
+    if (!installerBusy_.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    installerCancel_.store(false);
+    if (installerThread_.joinable()) {
+        installerThread_.join();
+    }
+    installerThread_ = std::thread([this, task = std::move(task)] {
+        try {
+            task();
+        } catch (const std::exception& error) {
+            PublishKernelUpdate([&error](runtime::KernelUpdateSnapshot& snapshot) {
+                snapshot.stage = runtime::InstallStage::Failed;
+                snapshot.checking = false;
+                snapshot.error = std::string("kernel installer error: ") + error.what();
+                snapshot.message = snapshot.error;
+            });
+        } catch (...) {
+            PublishKernelUpdate([](runtime::KernelUpdateSnapshot& snapshot) {
+                snapshot.stage = runtime::InstallStage::Failed;
+                snapshot.checking = false;
+                snapshot.error = "kernel installer error";
+                snapshot.message = snapshot.error;
+            });
+        }
+        installerBusy_.store(false);
+    });
+}
+
+void AppController::StopInstallerThread() {
+    installerCancel_.store(true);
+    if (installerThread_.joinable()) {
+        installerThread_.join();
+    }
+    installerBusy_.store(false);
+}
+
+void AppController::CheckKernelUpdate() {
+    if (installerBusy_.load()) {
+        return;
+    }
+    if (!installer_) {
+        CreateInstaller();
+    }
+    if (!installer_) {
+        ShowMessage("Kernel installer is not initialized.");
+        return;
+    }
+    PublishKernelUpdate([](runtime::KernelUpdateSnapshot& snapshot) {
+        snapshot = runtime::KernelUpdateSnapshot{};
+        snapshot.stage = runtime::InstallStage::Checking;
+        snapshot.checking = true;
+        snapshot.message = "Querying the latest Mihomo release";
+    });
+
+    runtime::KernelInstaller* installer = installer_.get();
+    StartInstallerThread([this, installer] {
+        auto progress = [this](const runtime::InstallProgress& value) {
+            PublishKernelUpdate([&value](runtime::KernelUpdateSnapshot& snapshot) {
+                snapshot.stage = value.stage;
+                snapshot.downloaded = value.downloaded;
+                snapshot.total = value.total;
+                snapshot.message = value.message;
+                snapshot.checking = value.stage == runtime::InstallStage::Checking;
+            });
+        };
+
+        core::Result<runtime::KernelRelease> release =
+            installer->FetchLatest(installerCancel_, progress);
+        if (!release) {
+            PublishKernelUpdate([&release](runtime::KernelUpdateSnapshot& snapshot) {
+                snapshot.stage = runtime::InstallStage::Failed;
+                snapshot.checking = false;
+                snapshot.error = release.error().message;
+                snapshot.message = snapshot.error;
+            });
+            return;
+        }
+        core::Result<runtime::KernelAsset> asset =
+            runtime::SelectKernelAsset(release.value(), runtime::CurrentReleasePlatform());
+        if (!asset) {
+            PublishKernelUpdate([&asset](runtime::KernelUpdateSnapshot& snapshot) {
+                snapshot.stage = runtime::InstallStage::Failed;
+                snapshot.checking = false;
+                snapshot.error = asset.error().message;
+                snapshot.message = snapshot.error;
+            });
+            return;
+        }
+
+        const runtime::KernelRelease selectedRelease = release.value();
+        const runtime::KernelAsset selectedAsset = asset.value();
+        {
+            std::lock_guard<std::mutex> lock(installerMutex_);
+            latestRelease_ = selectedRelease;
+            latestAsset_ = selectedAsset;
+            latestReleaseReady_ = true;
+        }
+        PublishKernelUpdate([&selectedRelease, &selectedAsset](
+                                runtime::KernelUpdateSnapshot& snapshot) {
+            snapshot = runtime::KernelUpdateSnapshot{};
+            snapshot.stage = runtime::InstallStage::Idle;
+            snapshot.releaseReady = true;
+            snapshot.releaseTag = selectedRelease.tag;
+            snapshot.releasePublishedAt = selectedRelease.publishedAt;
+            snapshot.releaseUrl = selectedRelease.htmlUrl;
+            snapshot.assetName = selectedAsset.name;
+            snapshot.assetSize = selectedAsset.size;
+            snapshot.assetDigest = runtime::NormalizeSha256(selectedAsset.digest);
+            snapshot.message = "Latest release " + selectedRelease.tag;
+        });
+    });
+}
+
+void AppController::DownloadKernelUpdate(bool allowUnverifiedChecksum) {
+    if (installerBusy_.load()) {
+        return;
+    }
+    if (!installer_) {
+        CreateInstaller();
+    }
+    if (!installer_) {
+        ShowMessage("Kernel installer is not initialized.");
+        return;
+    }
+
+    bool missingDigest = false;
+    if (!allowUnverifiedChecksum) {
+        std::lock_guard<std::mutex> lock(installerMutex_);
+        missingDigest = latestReleaseReady_ &&
+                        runtime::NormalizeSha256(latestAsset_.digest).empty();
+    }
+    if (missingDigest) {
+        if (shell_ != nullptr &&
+            shell_->ShowConfirmDialog(
+                "Unverified kernel",
+                "This release does not publish a SHA256 digest. Continue without official "
+                "verification?",
+                "Download anyway")) {
+            DownloadKernelUpdate(true);
+        }
+        return;
+    }
+
+    PublishKernelUpdate([](runtime::KernelUpdateSnapshot& snapshot) {
+        snapshot.stage = runtime::InstallStage::Downloading;
+        snapshot.checking = false;
+        snapshot.error.clear();
+        snapshot.installedPath.clear();
+        snapshot.installedVersion.clear();
+        snapshot.message = "Preparing the download";
+    });
+
+    runtime::KernelInstaller* installer = installer_.get();
+    StartInstallerThread([this, installer, allowUnverifiedChecksum] {
+        runtime::KernelRelease release;
+        runtime::KernelAsset asset;
+        bool ready = false;
+        {
+            std::lock_guard<std::mutex> lock(installerMutex_);
+            ready = latestReleaseReady_;
+            release = latestRelease_;
+            asset = latestAsset_;
+        }
+
+        auto publishRelease = [this](const runtime::KernelRelease& value,
+                                     const runtime::KernelAsset& selected) {
+            PublishKernelUpdate([&value, &selected](runtime::KernelUpdateSnapshot& snapshot) {
+                snapshot.releaseReady = true;
+                snapshot.releaseTag = value.tag;
+                snapshot.releasePublishedAt = value.publishedAt;
+                snapshot.releaseUrl = value.htmlUrl;
+                snapshot.assetName = selected.name;
+                snapshot.assetSize = selected.size;
+                snapshot.assetDigest = runtime::NormalizeSha256(selected.digest);
+            });
+        };
+
+        if (!ready) {
+            auto fetched = installer->FetchLatest(
+                installerCancel_, [this](const runtime::InstallProgress& value) {
+                    PublishKernelUpdate([&value](runtime::KernelUpdateSnapshot& snapshot) {
+                        snapshot.stage = value.stage;
+                        snapshot.message = value.message;
+                        snapshot.checking = value.stage == runtime::InstallStage::Checking;
+                    });
+                });
+            if (!fetched) {
+                PublishKernelUpdate([&fetched](runtime::KernelUpdateSnapshot& snapshot) {
+                    snapshot.stage = runtime::InstallStage::Failed;
+                    snapshot.error = fetched.error().message;
+                    snapshot.message = snapshot.error;
+                });
+                return;
+            }
+            auto selected =
+                runtime::SelectKernelAsset(fetched.value(), runtime::CurrentReleasePlatform());
+            if (!selected) {
+                PublishKernelUpdate([&selected](runtime::KernelUpdateSnapshot& snapshot) {
+                    snapshot.stage = runtime::InstallStage::Failed;
+                    snapshot.error = selected.error().message;
+                    snapshot.message = snapshot.error;
+                });
+                return;
+            }
+            release = fetched.value();
+            asset = selected.value();
+            {
+                std::lock_guard<std::mutex> lock(installerMutex_);
+                latestRelease_ = release;
+                latestAsset_ = asset;
+                latestReleaseReady_ = true;
+            }
+            publishRelease(release, asset);
+        }
+
+        if (installerCancel_.load()) {
+            PublishKernelUpdate([](runtime::KernelUpdateSnapshot& snapshot) {
+                snapshot.stage = runtime::InstallStage::Cancelled;
+                snapshot.message = "Download cancelled";
+            });
+            return;
+        }
+        if (!allowUnverifiedChecksum && runtime::NormalizeSha256(asset.digest).empty()) {
+            PublishKernelUpdate([](runtime::KernelUpdateSnapshot& snapshot) {
+                snapshot.stage = runtime::InstallStage::Failed;
+                snapshot.error =
+                    "this release does not provide a verifiable SHA256 digest";
+                snapshot.message = snapshot.error;
+            });
+            installerBusy_.store(false);
+            PostToUi([this] {
+                if (shell_ != nullptr &&
+                    shell_->ShowConfirmDialog(
+                        "Unverified kernel",
+                        "This release does not publish a SHA256 digest. Continue without "
+                        "official verification?",
+                        "Download anyway")) {
+                    DownloadKernelUpdate(true);
+                }
+            });
+            return;
+        }
+
+        installer->SetAllowUnverifiedChecksum(allowUnverifiedChecksum);
+        auto lastPublished = std::make_shared<std::uint64_t>(0);
+        auto progress = [this, lastPublished](const runtime::InstallProgress& value) {
+            if (value.stage == runtime::InstallStage::Downloading &&
+                value.downloaded < *lastPublished + 256 * 1024 &&
+                (value.total == 0 || value.downloaded < value.total)) {
+                return;
+            }
+            *lastPublished = value.downloaded;
+            PublishKernelUpdate([&value](runtime::KernelUpdateSnapshot& snapshot) {
+                snapshot.stage = value.stage;
+                snapshot.downloaded = value.downloaded;
+                snapshot.total = value.total;
+                snapshot.message = value.message;
+                snapshot.checking = false;
+            });
+        };
+
+        core::Result<runtime::KernelInstallResult> installed =
+            installer->Install(release, asset, installerCancel_, progress);
+        if (!installed) {
+            PublishKernelUpdate([&installed](runtime::KernelUpdateSnapshot& snapshot) {
+                if (installed.error().kind == core::ErrorKind::Cancelled) {
+                    snapshot.stage = runtime::InstallStage::Cancelled;
+                    snapshot.message = "Download cancelled";
+                } else {
+                    snapshot.stage = runtime::InstallStage::Failed;
+                    snapshot.error = installed.error().message;
+                    snapshot.message = snapshot.error;
+                }
+            });
+            if (installed.error().kind == core::ErrorKind::ChecksumMissing &&
+                !allowUnverifiedChecksum) {
+                installerBusy_.store(false);
+                PostToUi([this] {
+                    if (shell_ != nullptr &&
+                        shell_->ShowConfirmDialog(
+                            "Unverified kernel",
+                            "This release does not publish a SHA256 digest. Continue without "
+                            "official verification?",
+                            "Download anyway")) {
+                        DownloadKernelUpdate(true);
+                    }
+                });
+            }
+            return;
+        }
+
+        const runtime::KernelInstallResult result = installed.value();
+        PublishKernelUpdate([&result](runtime::KernelUpdateSnapshot& snapshot) {
+            snapshot.stage = runtime::InstallStage::Completed;
+            snapshot.downloaded = snapshot.total;
+            snapshot.installedVersion = result.version;
+            snapshot.installedPath = result.executablePath;
+            snapshot.installedChecksumVerified = result.checksumVerified;
+            snapshot.message = result.checksumVerified
+                                   ? "Installed and verified " + result.version
+                                   : "Installed " + result.version + " (unverified checksum)";
+            snapshot.error.clear();
+        });
+        PostToUi([this, result] {
+            const wxString body =
+                wxString::FromUTF8("Mihomo " + result.version +
+                                   " was installed.\n\nUse it for the next kernel start?");
+            if (shell_ != nullptr &&
+                shell_->ShowConfirmDialog("Kernel installed", body, "Use this kernel")) {
+                UseInstalledKernel();
+            } else {
+                ShowMessage("Kernel installed. You can switch kernels later in Settings.");
+            }
+        });
+    });
+}
+
+void AppController::CancelKernelUpdate() {
+    installerCancel_.store(true);
+    PublishKernelUpdate([](runtime::KernelUpdateSnapshot& snapshot) {
+        snapshot.message = "Cancelling the download";
+    });
+}
+
+void AppController::UseInstalledKernel() {
+    const runtime::KernelUpdateSnapshot* update = state_.Get().kernelUpdate.get();
+    if (update == nullptr || update->installedPath.empty()) {
+        ShowMessage("No installed kernel is available to switch to.");
+        return;
+    }
+    runtime::AppSettings next = settings_;
+    next.mihomoPath = update->installedPath;
+    wxString error;
+    bool restartRequired = false;
+    if (!SaveKernelSettings(next, &error, &restartRequired)) {
+        ShowMessage("Could not switch the kernel: " + error);
+        return;
+    }
+    ShowMessage(restartRequired
+                    ? "Kernel path updated. Restart the running kernel to use it."
+                    : "Kernel path updated.");
 }
 
 }  // namespace clashyuka::app

@@ -21,6 +21,10 @@ enum class ErrorKind {
     KernelNotFound,
     ConfigFailed,
     StartFailed,
+    DownloadFailed,
+    ChecksumMissing,
+    ChecksumMismatch,
+    ExtractFailed,
     Internal,
 };
 

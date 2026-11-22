@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 using core::ErrorKind;
 using core::MakeError;
 
-constexpr int kSettingsVersion = 1;
+constexpr int kSettingsVersion = 2;
 
 fs::path PathFromUtf8(const std::string& value) {
     return fs::path(std::u8string(value.begin(), value.end()));
@@ -65,6 +65,10 @@ core::Result<void> WriteSettingsFile(const fs::path& path, const AppSettings& se
     root["mixedPort"] = settings.mixedPort;
     root["secret"] = settings.secret;
     root["autoStartKernel"] = settings.autoStartKernel;
+    root["proxyTestUrl"] = settings.proxyTestUrl;
+    root["proxyTestTimeoutMs"] = settings.proxyTestTimeoutMs;
+    root["kernelInstallDir"] = settings.kernelInstallDir;
+    root["downloadProxy"] = settings.downloadProxy;
 
     {
         std::ofstream output(temp, std::ios::binary | std::ios::trunc);
@@ -162,6 +166,10 @@ SettingsLoadResult LoadSettings(const std::string& path) {
     partial |= !ReadInt(root, "mixedPort", settings.mixedPort);
     partial |= !ReadString(root, "secret", settings.secret);
     partial |= !ReadBool(root, "autoStartKernel", settings.autoStartKernel);
+    partial |= !ReadString(root, "proxyTestUrl", settings.proxyTestUrl);
+    partial |= !ReadInt(root, "proxyTestTimeoutMs", settings.proxyTestTimeoutMs);
+    partial |= !ReadString(root, "kernelInstallDir", settings.kernelInstallDir);
+    partial |= !ReadString(root, "downloadProxy", settings.downloadProxy);
 
     if (settings.secret.empty()) {
         settings.secret = GenerateLocalSecret();
@@ -207,6 +215,24 @@ core::Result<void> ValidateSettings(const AppSettings& settings) {
     if (settings.secret.size() > 256 || settings.secret.find('\n') != std::string::npos ||
         settings.secret.find('\r') != std::string::npos) {
         return MakeError(ErrorKind::InvalidConfig, "the API secret is invalid");
+    }
+    if (settings.proxyTestUrl.empty() ||
+        (settings.proxyTestUrl.rfind("http://", 0) != 0 &&
+         settings.proxyTestUrl.rfind("https://", 0) != 0) ||
+        settings.proxyTestUrl.find('\n') != std::string::npos ||
+        settings.proxyTestUrl.find('\r') != std::string::npos) {
+        return MakeError(ErrorKind::InvalidConfig,
+                         "the proxy delay test URL must be an HTTP(S) URL");
+    }
+    if (settings.proxyTestTimeoutMs < 1000 || settings.proxyTestTimeoutMs > 60000) {
+        return MakeError(ErrorKind::InvalidConfig,
+                         "the proxy delay timeout must be between 1000 and 60000 ms");
+    }
+    if (!settings.downloadProxy.empty() &&
+        settings.downloadProxy.rfind("http://", 0) != 0 &&
+        settings.downloadProxy.rfind("https://", 0) != 0) {
+        return MakeError(ErrorKind::InvalidConfig,
+                         "the download proxy must be an http:// or https:// URL");
     }
     return {};
 }

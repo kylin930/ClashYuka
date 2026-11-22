@@ -33,6 +33,8 @@ struct ProxyInfo {
     std::vector<ProxyHistory> history;
     std::string now;
     std::vector<std::string> all;
+    std::string fixed;
+    std::string providerName;
     std::string testUrl;
     std::string icon;
     bool hidden = false;

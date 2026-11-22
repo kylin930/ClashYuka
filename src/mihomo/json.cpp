@@ -137,6 +137,8 @@ core::Result<ProxyInfo> ParseProxyInfo(const Json& json) {
     proxy.alive = BoolOr(json, "alive");
     proxy.now = StringOr(json, "now");
     proxy.all = StringArray(json, "all");
+    proxy.fixed = StringOr(json, "fixed");
+    proxy.providerName = StringOr(json, "provider-name");
     proxy.testUrl = StringOr(json, "testUrl");
     proxy.icon = StringOr(json, "icon");
     proxy.hidden = BoolOr(json, "hidden");

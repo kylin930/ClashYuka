@@ -160,4 +160,20 @@ void AppState::SetKernelError(std::string error) {
     Notify();
 }
 
+void AppState::SetProxyCatalog(std::shared_ptr<const runtime::ProxyCatalog> catalog) {
+    if (snapshot_.proxyCatalog == catalog) {
+        return;
+    }
+    snapshot_.proxyCatalog = std::move(catalog);
+    Notify();
+}
+
+void AppState::SetKernelUpdate(std::shared_ptr<const runtime::KernelUpdateSnapshot> update) {
+    if (snapshot_.kernelUpdate == update) {
+        return;
+    }
+    snapshot_.kernelUpdate = std::move(update);
+    Notify();
+}
+
 }  // namespace clashyuka::app

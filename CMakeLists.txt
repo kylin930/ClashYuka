@@ -41,20 +41,29 @@ include(cmake/Dependencies.cmake)
 find_package(Threads REQUIRED)
 
 if(WIN32)
-  set(CLASHYUKA_PLATFORM_SOURCE src/platform/windows/platform_services_windows.cpp)
+  set(CLASHYUKA_PLATFORM_SOURCES
+    src/platform/windows/platform_services_windows.cpp
+    src/platform/windows/http_download_windows.cpp
+  )
 elseif(APPLE)
-  set(CLASHYUKA_PLATFORM_SOURCE src/platform/macos/platform_services_macos.cpp)
+  set(CLASHYUKA_PLATFORM_SOURCES
+    src/platform/macos/platform_services_macos.cpp
+    src/platform/posix/http_download_posix.cpp
+  )
 elseif(UNIX)
-  set(CLASHYUKA_PLATFORM_SOURCE src/platform/linux/platform_services_linux.cpp)
+  set(CLASHYUKA_PLATFORM_SOURCES
+    src/platform/linux/platform_services_linux.cpp
+    src/platform/posix/http_download_posix.cpp
+  )
 else()
   message(FATAL_ERROR "ClashYuka does not support this platform yet.")
 endif()
 
-add_library(clashyuka_platform STATIC ${CLASHYUKA_PLATFORM_SOURCE})
+add_library(clashyuka_platform STATIC ${CLASHYUKA_PLATFORM_SOURCES})
 target_include_directories(clashyuka_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(clashyuka_platform PUBLIC clashyuka_options)
 if(WIN32)
-  target_link_libraries(clashyuka_platform PUBLIC advapi32)
+  target_link_libraries(clashyuka_platform PUBLIC advapi32 winhttp)
 endif()
 
 add_library(clashyuka_core STATIC
@@ -121,6 +130,10 @@ add_library(clashyuka_runtime STATIC
   src/runtime/settings_store.cpp
   src/runtime/runtime_config.cpp
   src/runtime/kernel_session.cpp
+  src/runtime/proxy_service.cpp
+  src/runtime/kernel_release.cpp
+  src/runtime/sha256.cpp
+  src/runtime/kernel_installer.cpp
 )
 target_include_directories(clashyuka_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(clashyuka_runtime
@@ -172,6 +185,7 @@ target_link_libraries(clashyuka_ui PUBLIC clashyuka_options ${wxWidgets_LIBRARIE
 add_library(clashyuka_app STATIC
   src/app/app_state.cpp
   src/app/app_controller.cpp
+  src/app/archive_extractor.cpp
   src/app/page_registry.cpp
   src/ui/main_window.cpp
   src/ui/pages/page_base.cpp
@@ -230,6 +244,7 @@ if(CLASHYUKA_BUILD_TESTS)
     tests/test_models.cpp
     tests/test_api_client.cpp
     tests/test_event_client.cpp
+    tests/test_http_download.cpp
   )
   target_include_directories(clashyuka_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(clashyuka_tests PRIVATE
@@ -265,6 +280,26 @@ if(CLASHYUKA_BUILD_TESTS)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   add_test(NAME clashyuka_runtime_tests COMMAND clashyuka_runtime_tests)
+
+  add_executable(clashyuka_proxy_tests tests/test_proxy_service.cpp)
+  target_link_libraries(clashyuka_proxy_tests PRIVATE
+    clashyuka_runtime
+    doctest::doctest
+  )
+  set_target_properties(clashyuka_proxy_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  add_test(NAME clashyuka_proxy_tests COMMAND clashyuka_proxy_tests)
+
+  add_executable(clashyuka_install_tests tests/test_installer.cpp)
+  target_link_libraries(clashyuka_install_tests PRIVATE
+    clashyuka_app
+    doctest::doctest
+  )
+  set_target_properties(clashyuka_install_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  add_test(NAME clashyuka_install_tests COMMAND clashyuka_install_tests)
 
   add_executable(clashyuka_process_probe tests/helpers/process_probe.cpp)
   set_target_properties(clashyuka_process_probe PROPERTIES

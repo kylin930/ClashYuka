@@ -339,4 +339,12 @@ void MainWindow::ShowInfoDialog(const wxString& title, const wxString& body) {
     dialog.ShowModal();
 }
 
+bool MainWindow::ShowConfirmDialog(const wxString& title, const wxString& body,
+                                   const wxString& confirmLabel) {
+    Dialog dialog(this, title, body);
+    dialog.AddAction("Cancel", ButtonVariant::Text, wxID_CANCEL);
+    dialog.AddAction(confirmLabel, ButtonVariant::Filled, wxID_OK);
+    return dialog.ShowModal() == wxID_OK;
+}
+
 }  // namespace clashyuka::ui

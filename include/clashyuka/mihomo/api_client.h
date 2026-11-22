@@ -47,6 +47,13 @@ public:
     // PUT /proxies/{group} with {"name": target}
     core::Result<void> SelectProxy(std::string_view group, std::string_view target) const;
 
+    // DELETE /proxies/{group} clears a fixed selection on URLTest/Fallback.
+    core::Result<void> ClearProxySelection(std::string_view group) const;
+
+    // GET /proxies/{name}/delay?url=...&timeout=...
+    core::Result<int> TestProxyDelay(std::string_view name, std::string_view url,
+                                     int timeoutMs) const;
+
     core::Result<RuntimeConfiguration> GetConfigs() const;
     core::Result<void> PatchConfigs(const nlohmann::json& patch) const;
     core::Result<RuleCollection> GetRules() const;

@@ -41,6 +41,10 @@ std::string EncodePathSegment(std::string_view segment) {
     return encoded;
 }
 
+std::string EncodeQueryComponent(std::string_view value) {
+    return EncodePathSegment(value);
+}
+
 bool IsWildcardAddress(std::string_view host) {
     return host.empty() || host == "*" || host == "0.0.0.0" || host == "::" ||
            host == "[::]";

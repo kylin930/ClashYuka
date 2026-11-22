@@ -138,6 +138,9 @@ public:
 
     KernelPhase Phase() const;
     KernelSnapshot Snapshot() const;
+    // Effective controller configuration (including the secret) for in-process
+    // services such as the proxy catalog. Never expose this to UI text.
+    mihomo::MihomoApiConfig ApiConfig() const;
 
 private:
     struct SharedState;

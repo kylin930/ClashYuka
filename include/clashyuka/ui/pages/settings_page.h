@@ -8,6 +8,7 @@ namespace clashyuka::ui {
 
 class Button;
 class ListItem;
+class ProgressIndicator;
 class SearchField;
 class Switch;
 class TextBlock;
@@ -21,8 +22,11 @@ protected:
 
 private:
     void BrowseKernelPath();
+    void BrowseInstallDirectory();
+    void OpenInstallDirectory();
     void SaveMihomoSettings();
     void SyncMihomoSettings();
+    void ApplyKernelUpdate(const app::AppStateSnapshot& state);
 
     Button* lightButton_ = nullptr;
     Button* darkButton_ = nullptr;
@@ -33,8 +37,21 @@ private:
     SearchField* apiPortField_ = nullptr;
     SearchField* secretField_ = nullptr;
     Switch* autoStart_ = nullptr;
+    SearchField* testUrlField_ = nullptr;
+    SearchField* testTimeoutField_ = nullptr;
+    SearchField* installDirField_ = nullptr;
+    SearchField* downloadProxyField_ = nullptr;
     TextBlock* kernelStatusLine_ = nullptr;
+    TextBlock* kernelUpdateLine_ = nullptr;
+    TextBlock* releaseLine_ = nullptr;
+    ProgressIndicator* updateProgress_ = nullptr;
+    Button* checkUpdateButton_ = nullptr;
+    Button* downloadButton_ = nullptr;
+    Button* cancelUpdateButton_ = nullptr;
+    Button* useKernelButton_ = nullptr;
     bool mihomoFieldsInitialized_ = false;
+    bool updateApplied_ = false;
+    const runtime::KernelUpdateSnapshot* shownUpdate_ = nullptr;
 };
 
 }  // namespace clashyuka::ui

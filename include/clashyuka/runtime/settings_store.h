@@ -17,6 +17,15 @@ struct AppSettings {
     int mixedPort = 7897;
     std::string secret;
     bool autoStartKernel = false;
+
+    // Proxy page delay test. The default avoids relying on a provider URL.
+    std::string proxyTestUrl = "https://www.gstatic.com/generate_204";
+    int proxyTestTimeoutMs = 5000;
+
+    // Kernel installer. Empty install root means "<settings dir>/kernels".
+    std::string kernelInstallDir;
+    // Empty means "use the system proxy".
+    std::string downloadProxy;
 };
 
 struct SettingsLoadResult {

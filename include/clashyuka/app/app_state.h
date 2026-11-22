@@ -1,9 +1,15 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "clashyuka/ui/theme/theme_manager.h"
+
+namespace clashyuka::runtime {
+struct ProxyCatalog;
+struct KernelUpdateSnapshot;
+}
 
 namespace clashyuka::app {
 
@@ -50,6 +56,11 @@ struct AppStateSnapshot {
     // Friendly, user-facing text for the last kernel failure. Technical detail
     // stays in the runtime log.
     std::string kernelError;
+
+    // Shared, immutable proxy catalog. A shared_ptr keeps AppState copies cheap
+    // even for large proxy collections.
+    std::shared_ptr<const runtime::ProxyCatalog> proxyCatalog;
+    std::shared_ptr<const runtime::KernelUpdateSnapshot> kernelUpdate;
 };
 
 class AppStateObserver {
@@ -82,6 +93,8 @@ public:
     void SetKernelPath(std::string path);
     void SetApiAddress(std::string address);
     void SetKernelError(std::string error);
+    void SetProxyCatalog(std::shared_ptr<const runtime::ProxyCatalog> catalog);
+    void SetKernelUpdate(std::shared_ptr<const runtime::KernelUpdateSnapshot> update);
 
 private:
     void Notify();
