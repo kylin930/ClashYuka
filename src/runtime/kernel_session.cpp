@@ -40,10 +40,30 @@ struct KernelSession::SharedState {
     std::string apiAddress;
     std::string configPath;
     bool generatedConfig = false;
+    int mixedPort = 0;
     core::Error error;
     std::string eventError;
     KernelSessionObserver* observer = nullptr;
     mihomo::MihomoApiConfig apiConfig;
+    std::string runningProfileId;
+    std::optional<ProfileSwitchResult> pendingSwitch;
+    std::optional<ProfileSwitchResult> switchResult;
+    std::uint64_t nextSwitchId = 0;
+    std::uint64_t nextPublication = 0;
+    std::uint64_t deliveredPublication = 0;
+    bool imported = false;
+};
+
+struct KernelSession::LaunchConfig {
+    KernelOptions options;
+    std::unique_ptr<RuntimeConfigCopy> copy;
+    bool imported = false;
+};
+
+struct KernelSession::ProcessStatus {
+    std::atomic<bool> active{true};
+    std::atomic<bool> exited{false};
+    std::atomic<int> exitCode{0};
 };
 
 const char* KernelPhaseName(KernelPhase phase) {
@@ -109,8 +129,12 @@ KernelSnapshot KernelSession::Snapshot() const {
     snapshot.apiAddress = state_->apiAddress;
     snapshot.configPath = state_->configPath;
     snapshot.generatedConfig = state_->generatedConfig;
+    snapshot.mixedPort = state_->mixedPort;
     snapshot.error = state_->error;
     snapshot.eventError = state_->eventError;
+    snapshot.runningProfileId = state_->runningProfileId;
+    snapshot.profileSwitchInProgress = state_->pendingSwitch.has_value();
+    snapshot.profileSwitchResult = state_->switchResult;
     return snapshot;
 }
 
@@ -127,8 +151,9 @@ void KernelSession::Start() {
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         const KernelPhase phase = state_->phase;
-        if (phase == KernelPhase::Starting || phase == KernelPhase::WaitingForApi ||
-            phase == KernelPhase::Running || phase == KernelPhase::Stopping) {
+        if (state_->pendingSwitch || phase == KernelPhase::Starting ||
+            phase == KernelPhase::WaitingForApi || phase == KernelPhase::Running ||
+            phase == KernelPhase::Stopping) {
             return;
         }
         generation = ++state_->generation;
@@ -138,9 +163,8 @@ void KernelSession::Start() {
         state_->eventError.clear();
         state_->configPath.clear();
         state_->generatedConfig = false;
+        cancelRequested_.store(false);
     }
-    cancelRequested_.store(false);
-    processExited_.store(false);
     Publish();
     Enqueue({CommandType::Start, generation});
 }
@@ -159,8 +183,8 @@ void KernelSession::Stop() {
         }
         state_->phase = KernelPhase::Stopping;
         generation = state_->generation;
+        cancelRequested_.store(true);
     }
-    cancelRequested_.store(true);
     Publish();
     Enqueue({CommandType::Stop, generation});
 }
@@ -173,6 +197,9 @@ void KernelSession::Restart() {
     bool active = false;
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->pendingSwitch) {
+            return;
+        }
         const KernelPhase phase = state_->phase;
         active = phase == KernelPhase::Starting || phase == KernelPhase::WaitingForApi ||
                  phase == KernelPhase::Running || phase == KernelPhase::Stopping;
@@ -188,17 +215,42 @@ void KernelSession::Restart() {
             state_->configPath.clear();
             state_->generatedConfig = false;
         }
+        cancelRequested_.store(active);
     }
-    cancelRequested_.store(active);
-    processExited_.store(false);
     Publish();
     Enqueue({active ? CommandType::Restart : CommandType::Start, generation});
 }
 
+std::optional<std::uint64_t> KernelSession::SwitchProfile(KernelProfile profile) {
+    Command command;
+    command.type = CommandType::SwitchProfile;
+    command.options = Options();
+    command.options.profile = std::move(profile);
+    std::uint64_t requestId = 0;
+    {
+        std::scoped_lock lock(state_->mutex, queueMutex_);
+        if (shutdownRequested_.load() || state_->phase != KernelPhase::Running ||
+            state_->pendingSwitch) {
+            return std::nullopt;
+        }
+        command.generation = state_->generation;
+        requestId = ++state_->nextSwitchId;
+        command.profileSwitch.requestId = requestId;
+        command.profileSwitch.oldProfileId = state_->runningProfileId;
+        command.profileSwitch.newProfileId = command.options.profile.id;
+        state_->pendingSwitch = command.profileSwitch;
+        queue_.push_back(std::move(command));
+    }
+    Publish();
+    queueCv_.notify_all();
+    return requestId;
+}
+
 void KernelSession::Shutdown() {
     {
-        std::lock_guard<std::mutex> lock(queueMutex_);
+        std::scoped_lock lock(state_->mutex, queueMutex_);
         shutdownRequested_.store(true);
+        state_->observer = nullptr;
         queue_.clear();
     }
     cancelRequested_.store(true);
@@ -212,11 +264,6 @@ void KernelSession::Shutdown() {
     if (worker_.joinable()) {
         worker_.join();
     }
-
-    {
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        state_->observer = nullptr;
-    }
 }
 
 void KernelSession::Enqueue(Command command) {
@@ -225,7 +272,7 @@ void KernelSession::Enqueue(Command command) {
         if (shutdownRequested_.load()) {
             return;
         }
-        queue_.push_back(command);
+        queue_.push_back(std::move(command));
     }
     queueCv_.notify_all();
 }
@@ -243,7 +290,7 @@ void KernelSession::WorkerMain() {
                 queue_.clear();
                 shutdown = true;
             } else {
-                command = queue_.front();
+                command = std::move(queue_.front());
                 queue_.pop_front();
             }
         }
@@ -264,14 +311,13 @@ void KernelSession::WorkerMain() {
                 case CommandType::Restart:
                     HandleRestart(command.generation);
                     break;
+                case CommandType::SwitchProfile:
+                    HandleProfileSwitch(std::move(command));
+                    break;
                 case CommandType::ProcessExited:
                     HandleProcessExited(command.generation);
                     break;
             }
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "[clashyuka] kernel worker error: %s\n", error.what());
-            Fail(command.generation, core::ErrorKind::Internal,
-                 "unexpected error in the kernel worker");
         } catch (...) {
             std::fprintf(stderr, "[clashyuka] kernel worker error: unknown exception\n");
             Fail(command.generation, core::ErrorKind::Internal,
@@ -299,8 +345,10 @@ void KernelSession::HandleShutdown() {
         state_->version.clear();
         state_->error = {};
         state_->eventError.clear();
+        state_->runningProfileId.clear();
+        state_->pendingSwitch.reset();
     }
-    Publish();
+    activeConfig_.reset();
 }
 
 void KernelSession::HandleStart(std::uint64_t generation) {
@@ -314,54 +362,108 @@ void KernelSession::HandleStart(std::uint64_t generation) {
         }
     }
 
-    const KernelOptions options = Options();
+    auto config = PrepareLaunch(Options(), false);
+    if (!config) {
+        Fail(generation, config.error().kind, config.error().message);
+        return;
+    }
+    activeConfig_ = std::move(config.value());
+    const auto launched = Launch(generation, *activeConfig_);
+    if (!launched) {
+        Fail(generation, launched.error().kind, launched.error().message);
+    }
+}
+
+core::Result<std::unique_ptr<KernelSession::LaunchConfig>> KernelSession::PrepareLaunch(
+    KernelOptions options, bool switching) {
+    const bool imported = options.profile.yaml.has_value();
+    if (options.profile.id.empty() || (options.profile.id == "builtin") == imported) {
+        return core::MakeError(core::ErrorKind::ConfigFailed, "selected profile content is unavailable");
+    }
     std::error_code fileError;
     if (options.executablePath.empty() ||
         !fs::is_regular_file(PathFromUtf8(options.executablePath), fileError) || fileError) {
-        Fail(generation, core::ErrorKind::KernelNotFound,
-             "mihomo executable was not found at '" + options.executablePath + "'");
-        return;
+        return core::MakeError(core::ErrorKind::KernelNotFound, "mihomo executable was not found");
     }
-    if (options.workingDirectory.empty() || options.configPath.empty()) {
-        Fail(generation, core::ErrorKind::ConfigFailed,
-             "the runtime directory or config path is not configured");
-        return;
+    if (options.workingDirectory.empty() || (!imported && options.configPath.empty())) {
+        return core::MakeError(core::ErrorKind::ConfigFailed,
+                               "the runtime directory or config path is not configured");
     }
-
-    RuntimeConfigDefinition definition;
-    definition.host = options.controllerHost;
-    definition.port = options.controllerPort;
-    definition.mixedPort = options.mixedPort;
-    definition.secret = options.secret;
-
-    core::Result<RuntimeConfigInfo> config = EnsureRuntimeConfig(options.configPath, definition);
-    if (!config) {
-        Fail(generation, core::ErrorKind::ConfigFailed, config.error().message);
-        return;
+    const RuntimeConfigDefinition definition{options.controllerHost, options.controllerPort,
+                                             options.mixedPort, options.secret};
+    auto copy = imported ? MakeProfileRuntimeCopy(options.workingDirectory, *options.profile.yaml, definition)
+                         : MakeLegacyRuntimeCopy(options.workingDirectory, options.configPath, definition);
+    if (!copy) {
+        return copy.error();
     }
-    const RuntimeConfigInfo info = config.value();
+    options.profile.yaml.reset();
+    auto config = std::make_unique<LaunchConfig>(
+        LaunchConfig{std::move(options), std::move(copy.value()), imported});
+    if (imported || switching) {
+        const auto checked = Preflight(*config);
+        if (!checked) {
+            return checked.error();
+        }
+    }
+    return config;
+}
 
+core::Result<void> KernelSession::Preflight(const LaunchConfig& config) {
+    using namespace std::chrono;
+    const auto deadline = steady_clock::now() +
+                          milliseconds(std::clamp(config.options.preflightTimeoutMs, 1, 15000));
+    auto process = drivers_->CreateProcess();
+    if (Cancelled()) {
+        return core::MakeError(core::ErrorKind::Cancelled, "profile preflight was cancelled");
+    }
+    if (!process || !process->Start({config.options.executablePath,
+                                    {"-t", "-d", config.copy->workingDirectory,
+                                     "-f", config.copy->configPath}}, {})) {
+        return core::MakeError(core::ErrorKind::StartFailed, "could not start Mihomo profile preflight");
+    }
+    while (!Cancelled() && steady_clock::now() < deadline) {
+        if (const auto code = process->ExitCode()) {
+            process->Stop();
+            if (*code == 0) {
+                return {};
+            }
+            return core::MakeError(core::ErrorKind::ProfilePreflightRejected,
+                                   "Mihomo rejected the profile configuration");
+        }
+        InterruptibleSleep(10);
+    }
+    process->Stop();
+    return Cancelled()
+        ? core::MakeError(core::ErrorKind::Cancelled, "profile preflight was cancelled")
+        : core::MakeError(core::ErrorKind::Timeout, "Mihomo profile preflight timed out");
+}
+
+core::Result<void> KernelSession::Launch(std::uint64_t generation, const LaunchConfig& config,
+                                        ProfileSwitchResult* readyResult) {
+    const auto cancelled = core::MakeError(core::ErrorKind::Cancelled, "kernel launch was cancelled");
+    const auto& options = config.options;
+    const auto& info = config.copy->info;
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
-        if (state_->generation != generation) {
-            return;
+        if (Cancelled() || state_->generation != generation) {
+            return cancelled;
         }
         state_->apiAddress = FormatAddress(info.host, info.port);
-        state_->configPath = options.configPath;
+        state_->configPath = config.copy->configPath;
         state_->generatedConfig = info.generated;
-    }
-    Publish();
-
-    if (Cancelled() || !IsCurrent(generation)) {
-        return;
+        state_->mixedPort = info.mixedPort;
+        state_->imported = config.imported;
     }
 
-    processExited_.store(false);
-    processExitCode_.store(0);
     process_ = drivers_->CreateProcess();
     if (!process_) {
-        Fail(generation, core::ErrorKind::StartFailed, "process driver is unavailable");
-        return;
+        return core::MakeError(core::ErrorKind::StartFailed, "process driver is unavailable");
+    }
+    const auto status = std::make_shared<ProcessStatus>();
+    processStatus_ = status;
+    {
+        std::lock_guard<std::mutex> lock(outputMutex_);
+        recentOutput_.clear();
     }
 
     mihomo::MihomoApiConfig apiConfig;
@@ -370,7 +472,7 @@ void KernelSession::HandleStart(std::uint64_t generation) {
     apiConfig.secret = info.secret;
     apiConfig.connectionTimeoutMs = options.readinessTimeoutMs;
     apiConfig.readTimeoutMs = options.readinessTimeoutMs;
-    apiConfig.kernelRunningProbe = [this] { return process_ && process_->IsRunning(); };
+    apiConfig.kernelRunningProbe = [status] { return status->active.load() && !status->exited.load(); };
     api_ = drivers_->CreateApi(apiConfig);
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
@@ -379,41 +481,39 @@ void KernelSession::HandleStart(std::uint64_t generation) {
 
     mihomo::MihomoLaunchOptions launch;
     launch.executablePath = options.executablePath;
-    launch.arguments = {"-d", options.workingDirectory, "-f", options.configPath};
+    launch.arguments = {"-d", config.copy->workingDirectory, "-f", config.copy->configPath};
 
     mihomo::MihomoProcessHandlers handlers;
-    handlers.onStdoutLine = [this](std::string_view line) {
-        std::lock_guard<std::mutex> lock(outputMutex_);
-        if (line.empty()) {
-            return;
-        }
-        recentOutput_.emplace_back(line.substr(0, 300));
-        if (recentOutput_.size() > kRecentOutputLimit) {
-            recentOutput_.pop_front();
-        }
-    };
-    handlers.onStderrLine = handlers.onStdoutLine;
-    handlers.onExited = [this, generation](int exitCode) {
-        processExitCode_.store(exitCode);
-        processExited_.store(true);
-        if (IsCurrent(generation)) {
-            cancelRequested_.store(true);
+    if (!config.imported) {
+        handlers.onStdoutLine = [this](std::string_view line) {
+            std::lock_guard<std::mutex> lock(outputMutex_);
+            if (!line.empty()) {
+                recentOutput_.emplace_back(line.substr(0, 300));
+                if (recentOutput_.size() > kRecentOutputLimit) {
+                    recentOutput_.pop_front();
+                }
+            }
+        };
+        handlers.onStderrLine = handlers.onStdoutLine;
+    }
+    handlers.onExited = [this, generation, status](int exitCode) {
+        status->exitCode.store(exitCode);
+        status->exited.store(true);
+        if (status->active.load() && IsCurrent(generation)) {
             Enqueue({CommandType::ProcessExited, generation});
         }
-        queueCv_.notify_all();
     };
 
     if (!process_->Start(launch, std::move(handlers))) {
-        Fail(generation, core::ErrorKind::StartFailed,
-             "could not start mihomo. " + RecentOutput());
-        return;
+        return core::MakeError(core::ErrorKind::StartFailed,
+            config.imported ? "could not start Mihomo" : "could not start Mihomo. " + RecentOutput());
     }
     core::MarkStartup("mihomo-process-start");
 
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
-        if (state_->generation != generation) {
-            return;
+        if (Cancelled() || state_->generation != generation) {
+            return cancelled;
         }
         state_->phase = KernelPhase::WaitingForApi;
     }
@@ -422,7 +522,7 @@ void KernelSession::HandleStart(std::uint64_t generation) {
     const int attempts = std::max(1, options.readinessAttempts);
     core::Error lastError;
     for (int attempt = 0; attempt < attempts; ++attempt) {
-        if (Cancelled()) {
+        if (Cancelled() || status->exited.load()) {
             break;
         }
         core::Result<mihomo::MihomoVersion> version = api_ ? api_->GetVersion()
@@ -431,7 +531,7 @@ void KernelSession::HandleStart(std::uint64_t generation) {
                                                                      core::ErrorKind::StartFailed,
                                                                      "API driver is unavailable"));
         if (version) {
-            if (Cancelled() || !IsCurrent(generation)) {
+            if (Cancelled() || status->exited.load() || !process_->IsRunning() || !IsCurrent(generation)) {
                 break;
             }
 
@@ -506,22 +606,28 @@ void KernelSession::HandleStart(std::uint64_t generation) {
 
             {
                 std::lock_guard<std::mutex> lock(state_->mutex);
-                if (state_->generation != generation) {
-                    return;
+                if (Cancelled() || state_->generation != generation || status->exited.load() ||
+                    !process_->IsRunning()) {
+                    break;
                 }
                 state_->phase = KernelPhase::Running;
                 state_->version = version.value().version;
                 state_->error = {};
+                state_->runningProfileId = options.profile.id;
+                if (readyResult) {
+                    state_->switchResult = *readyResult;
+                    state_->pendingSwitch.reset();
+                }
             }
             core::MarkStartup("mihomo-api-ready");
             Publish();
-            return;
+            return {};
         }
 
         lastError = version.error();
         if (lastError.kind == core::ErrorKind::AuthFailed) {
-            Fail(generation, core::ErrorKind::AuthFailed, lastError.message);
-            return;
+            return core::MakeError(core::ErrorKind::AuthFailed,
+                config.imported ? "Mihomo API authentication failed" : lastError.message);
         }
         if (Cancelled()) {
             break;
@@ -531,30 +637,145 @@ void KernelSession::HandleStart(std::uint64_t generation) {
         }
     }
 
-    if (processExited_.load()) {
-        Fail(generation, core::ErrorKind::StartFailed,
-             "mihomo exited during startup (code " + std::to_string(processExitCode_.load()) + ")");
-        return;
-    }
     if (Cancelled() || !IsCurrent(generation)) {
-        // Stop/Shutdown owns the final state. Release local resources only.
-        StopEvents();
-        StopProcess();
+        return cancelled;
+    }
+    if (status->exited.load() || !process_->IsRunning()) {
+        return core::MakeError(core::ErrorKind::StartFailed,
+            "mihomo exited during startup (code " + std::to_string(status->exitCode.load()) + ")");
+    }
+    return core::MakeError(core::ErrorKind::Timeout,
+        !config.imported && lastError ? lastError.message : "Mihomo API did not become ready");
+}
+
+void KernelSession::HandleProfileSwitch(Command command) {
+    auto& result = command.profileSwitch;
+    const auto cancel = [&] {
+        result.outcome = ProfileSwitchOutcome::Cancelled;
+        result.error = core::MakeError(core::ErrorKind::Cancelled, "profile switch was cancelled");
+        FinishProfileSwitch(result);
+    };
+    if (Cancelled()) {
+        cancel();
         return;
     }
-    Fail(generation, core::ErrorKind::Timeout,
-         lastError ? lastError.message : "mihomo API did not become ready");
+    if (!IsCurrent(command.generation) || !activeConfig_ || Phase() != KernelPhase::Running) {
+        result.outcome = ProfileSwitchOutcome::Rejected;
+        result.error = core::MakeError(core::ErrorKind::StartFailed, "the previous kernel is no longer running");
+        FinishProfileSwitch(std::move(result));
+        return;
+    }
+
+    auto candidate = [&]() -> core::Result<std::unique_ptr<LaunchConfig>> {
+        try {
+            return PrepareLaunch(std::move(command.options), true);
+        } catch (...) {
+            return core::MakeError(core::ErrorKind::Internal, "could not prepare the profile runtime copy");
+        }
+    }();
+    if (Cancelled()) {
+        cancel();
+        return;
+    }
+    if (!candidate) {
+        result.outcome = ProfileSwitchOutcome::Rejected;
+        result.error = candidate.error();
+        FinishProfileSwitch(std::move(result));
+        return;
+    }
+
+    std::uint64_t generation = 0;
+    const auto beginAttempt = [&] {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (Cancelled()) {
+            return false;
+        }
+        generation = ++state_->generation;
+        state_->phase = KernelPhase::Starting;
+        state_->runningProfileId.clear();
+        state_->version.clear();
+        state_->eventError.clear();
+        state_->error = {};
+        return true;
+    };
+    if (!beginAttempt()) {
+        cancel();
+        return;
+    }
+    // Invalidate the old API/event generation before touching its drivers.
+    Publish();
+    StopEvents();
+    StopProcess();
+
+    const auto tryLaunch = [&](const LaunchConfig& config) -> core::Result<void> {
+        try {
+            return Launch(generation, config, &result);
+        } catch (...) {
+            return core::MakeError(core::ErrorKind::Internal, "unexpected error starting Mihomo");
+        }
+    };
+    result.outcome = ProfileSwitchOutcome::Succeeded;
+    const auto launched = tryLaunch(*candidate.value());
+    if (launched) {
+        activeConfig_ = std::move(candidate.value());
+        return;
+    }
+    StopEvents();
+    StopProcess();
+    if (!beginAttempt()) {
+        cancel();
+        return;
+    }
+
+    result.outcome = ProfileSwitchOutcome::RolledBack;
+    result.error = launched.error();
+    Publish();
+    const auto restored = tryLaunch(*activeConfig_);
+    if (restored) {
+        return;
+    }
+    if (Cancelled()) {
+        cancel();
+        return;
+    }
+    result.outcome = ProfileSwitchOutcome::RollbackFailed;
+    result.error = core::MakeError(restored.error().kind,
+        "the new profile failed and the previous kernel could not be restored");
+    Fail(generation, result.error.kind, result.error.message);
+    FinishProfileSwitch(std::move(result));
+}
+
+void KernelSession::FinishProfileSwitch(ProfileSwitchResult result) {
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (shutdownRequested_.load() || !state_->pendingSwitch ||
+            state_->pendingSwitch->requestId != result.requestId) {
+            return;
+        }
+        if (cancelRequested_.load() && result.outcome != ProfileSwitchOutcome::Cancelled) {
+            result.outcome = ProfileSwitchOutcome::Cancelled;
+            result.error = core::MakeError(core::ErrorKind::Cancelled, "profile switch was cancelled");
+        }
+        state_->switchResult = std::move(result);
+        state_->pendingSwitch.reset();
+    }
+    Publish();
 }
 
 void KernelSession::HandleStop(std::uint64_t generation) {
+    if (!IsCurrent(generation)) {
+        return;
+    }
     StopEvents();
     StopProcess();
+    activeConfig_.reset();
 
     bool publish = false;
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         if (state_->generation == generation) {
             state_->phase = KernelPhase::Stopped;
+            state_->runningProfileId.clear();
             state_->version.clear();
             state_->error = {};
             state_->eventError.clear();
@@ -572,10 +793,12 @@ void KernelSession::HandleRestart(std::uint64_t generation) {
     }
     StopEvents();
     StopProcess();
+    activeConfig_.reset();
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         if (state_->generation == generation) {
             state_->phase = KernelPhase::Stopped;
+            state_->runningProfileId.clear();
             state_->version.clear();
             state_->error = {};
             state_->eventError.clear();
@@ -601,14 +824,13 @@ void KernelSession::BeginStartSession(std::uint64_t& generation) {
         state_->eventError.clear();
         state_->configPath.clear();
         state_->generatedConfig = false;
+        cancelRequested_.store(false);
     }
-    cancelRequested_.store(false);
-    processExited_.store(false);
     Publish();
 }
 
 void KernelSession::HandleProcessExited(std::uint64_t generation) {
-    if (!IsCurrent(generation)) {
+    if (!IsCurrent(generation) || !processStatus_ || !processStatus_->exited.load()) {
         return;
     }
     KernelPhase phase = KernelPhase::Stopped;
@@ -619,7 +841,7 @@ void KernelSession::HandleProcessExited(std::uint64_t generation) {
     if (phase == KernelPhase::Running || phase == KernelPhase::WaitingForApi ||
         phase == KernelPhase::Starting) {
         Fail(generation, core::ErrorKind::StartFailed,
-             "mihomo exited unexpectedly (code " + std::to_string(processExitCode_.load()) + ")");
+             "mihomo exited unexpectedly (code " + std::to_string(processStatus_->exitCode.load()) + ")");
     }
 }
 
@@ -629,6 +851,7 @@ void KernelSession::Fail(std::uint64_t generation, core::ErrorKind kind, std::st
     }
     StopEvents();
     StopProcess();
+    activeConfig_.reset();
 
     bool publish = false;
     {
@@ -636,6 +859,7 @@ void KernelSession::Fail(std::uint64_t generation, core::ErrorKind kind, std::st
         if (state_->generation == generation && state_->phase != KernelPhase::Stopping &&
             state_->phase != KernelPhase::Stopped) {
             state_->phase = KernelPhase::Failed;
+            state_->runningProfileId.clear();
             state_->version.clear();
             state_->error = core::MakeError(kind, std::move(message));
             publish = true;
@@ -652,16 +876,22 @@ void KernelSession::Publish() {
     }
     KernelSnapshot snapshot;
     KernelSessionObserver* observer = nullptr;
+    std::uint64_t publication = 0;
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
+        publication = ++state_->nextPublication;
         snapshot.phase = state_->phase;
         snapshot.generation = state_->generation;
         snapshot.version = state_->version;
         snapshot.apiAddress = state_->apiAddress;
         snapshot.configPath = state_->configPath;
         snapshot.generatedConfig = state_->generatedConfig;
+        snapshot.mixedPort = state_->mixedPort;
         snapshot.error = state_->error;
         snapshot.eventError = state_->eventError;
+        snapshot.runningProfileId = state_->runningProfileId;
+        snapshot.profileSwitchInProgress = state_->pendingSwitch.has_value();
+        snapshot.profileSwitchResult = state_->switchResult;
         observer = state_->observer;
     }
     if (observer == nullptr) {
@@ -669,20 +899,19 @@ void KernelSession::Publish() {
     }
     auto state = state_;
     try {
-        dispatcher_([state, snapshot] {
+        dispatcher_([state, snapshot, publication] {
             KernelSessionObserver* current = nullptr;
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
-                if (state->generation != snapshot.generation ||
-                    state->observer == nullptr) {
+                if (state->generation != snapshot.generation || state->observer == nullptr ||
+                    publication <= state->deliveredPublication) {
                     return;
                 }
+                state->deliveredPublication = publication;
                 current = state->observer;
             }
             current->OnKernelSnapshot(snapshot);
         });
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "[clashyuka] UI dispatch failed: %s\n", error.what());
     } catch (...) {
         std::fprintf(stderr, "[clashyuka] UI dispatch failed: unknown exception\n");
     }
@@ -694,7 +923,7 @@ void KernelSession::RecordEventError(std::uint64_t generation, const core::Error
         if (state_->generation != generation || !state_->eventError.empty()) {
             return;
         }
-        state_->eventError = error.message;
+        state_->eventError = state_->imported ? "Mihomo event stream is unavailable" : error.message;
     }
     Publish();
 }
@@ -726,6 +955,11 @@ void KernelSession::StopEvents() {
 }
 
 void KernelSession::StopProcess() {
+    if (processStatus_) {
+        processStatus_->active.store(false);
+        processStatus_.reset();
+    }
+    api_.reset();
     if (process_ != nullptr) {
         process_->Stop();
         process_.reset();

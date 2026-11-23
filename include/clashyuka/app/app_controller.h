@@ -7,15 +7,19 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <wx/string.h>
+#include <wx/timer.h>
 
 #include "clashyuka/app/app_state.h"
+#include "clashyuka/platform/system_proxy.h"
 #include "clashyuka/runtime/kernel_installer.h"
 #include "clashyuka/runtime/kernel_session.h"
 #include "clashyuka/runtime/proxy_service.h"
 #include "clashyuka/runtime/settings_store.h"
+#include "clashyuka/runtime/subscription_service.h"
 
 namespace clashyuka::app {
 
@@ -35,7 +39,8 @@ public:
 // runtime session. Pages must not mutate global state or touch Mihomo directly;
 // they call this controller.
 class AppController final : public runtime::KernelSessionObserver,
-                            public runtime::ProxyServiceObserver {
+                            public runtime::ProxyServiceObserver,
+                            private wxEvtHandler {
 public:
     explicit AppController(AppShell* shell);
     ~AppController() override;
@@ -81,6 +86,17 @@ public:
     void TestProxyDelay(std::string name);
     void TestGroupDelays(std::vector<std::string> names);
     void CancelProxyTests();
+    void SetSystemProxyEnabled(bool enabled);
+
+    void ImportProfile(const wxString& path);
+    void RenameProfile(const std::string& id, const wxString& name);
+    void DeleteProfile(const std::string& id);
+    void ActivateProfile(const std::string& id);
+    std::optional<runtime::SubscriptionSettings> SubscriptionForEdit(const std::string& id);
+    void AddSubscription(const wxString& name, const runtime::SubscriptionSettings& settings);
+    void EditSubscription(const std::string& id, const runtime::SubscriptionSettings& settings);
+    void RefreshSubscription(const std::string& id);
+    void CancelSubscription(const std::string& id);
 
     // Kernel release installation. All network/file work runs on a background
     // worker; snapshots are published on the GUI thread.
@@ -93,8 +109,17 @@ public:
 private:
     void SyncThemeState();
     runtime::KernelOptions BuildKernelOptions() const;
+    core::Result<runtime::KernelProfile> LoadProfile(const std::string& id) const;
+    bool PrepareSelectedKernel();
+    void PublishProfiles();
+    void TickSubscriptions();
+    void ProfileMessage(const wxString& message);
+    void PersistProfileSelection(const std::string& id);
+    void ConsumeProfileSwitch(const runtime::KernelSnapshot& snapshot);
+    bool CanDeleteProfile(const std::string& id) const;
     void CreateProxyService();
     void DestroyProxyService();
+    void SyncSystemProxy();
     void CreateInstaller();
     void StartInstallerThread(std::function<void()> task);
     void StopInstallerThread();
@@ -104,8 +129,28 @@ private:
     AppState state_;
     AppShell* shell_ = nullptr;
 
+    std::unique_ptr<runtime::ProfileStore> profileStore_;
+    std::unique_ptr<runtime::SubscriptionService> subscriptions_;
+    std::unique_ptr<wxTimer> subscriptionTimer_;
+    std::optional<runtime::SubscriptionService::JobId> addingSubscription_;
+    std::optional<std::uint64_t> pendingProfileSwitch_;
+    std::uint64_t switchRevision_ = 0;
+    std::uint64_t launchRevision_ = 0;
+    std::uint64_t runningRevision_ = 0;
+    // Counts successful publishes during this process. Record the revision at
+    // launch submission so a concurrent refresh never marks its newer bytes ready.
+    std::unordered_map<std::string, std::uint64_t> profileRevisions_;
+    std::string runningProfileId_;
+    std::string launchProfileId_;
+    std::string profileStoreError_;
+    std::string profileActionStatus_;
+
     std::unique_ptr<runtime::KernelSession> kernel_;
     std::unique_ptr<runtime::ProxyService> proxyService_;
+    std::uint64_t proxyServiceGeneration_ = 0;
+    std::shared_ptr<int> uiLifetime_;
+    std::unique_ptr<platform::SystemProxyController> systemProxy_;
+    int systemProxyPort_ = 0;
     runtime::AppSettings settings_;
     std::string settingsPath_;
     std::string settingsDirectory_;

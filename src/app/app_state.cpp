@@ -98,12 +98,16 @@ void AppState::SetProxyMode(ProxyMode mode) {
     Notify();
 }
 
-void AppState::SetProfile(std::string name, bool loaded) {
-    if (snapshot_.profileName == name && snapshot_.profileLoaded == loaded) {
+wxString ProfilesSnapshot::NameFor(const std::string& id, const wxString& fallback) const {
+    const auto row = std::ranges::find(rows, id, &ProfileRow::id);
+    return row == rows.end() ? fallback : wxString::FromUTF8(row->name);
+}
+
+void AppState::SetProfiles(ProfilesSnapshot profiles) {
+    if (snapshot_.profiles && *snapshot_.profiles == profiles) {
         return;
     }
-    snapshot_.profileName = std::move(name);
-    snapshot_.profileLoaded = loaded;
+    snapshot_.profiles = std::make_shared<const ProfilesSnapshot>(std::move(profiles));
     Notify();
 }
 
@@ -173,6 +177,17 @@ void AppState::SetKernelUpdate(std::shared_ptr<const runtime::KernelUpdateSnapsh
         return;
     }
     snapshot_.kernelUpdate = std::move(update);
+    Notify();
+}
+
+void AppState::SetSystemProxy(bool enabled, bool active, std::string address) {
+    if (snapshot_.systemProxyEnabled == enabled && snapshot_.systemProxyActive == active &&
+        snapshot_.systemProxyAddress == address) {
+        return;
+    }
+    snapshot_.systemProxyEnabled = enabled;
+    snapshot_.systemProxyActive = active;
+    snapshot_.systemProxyAddress = std::move(address);
     Notify();
 }
 

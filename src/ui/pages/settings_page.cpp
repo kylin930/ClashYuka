@@ -266,9 +266,20 @@ SettingsPage::SettingsPage(wxWindow* parent, app::AppController& controller)
     // --- Network -----------------------------------------------------------
     wxSizer* networkSizer = nullptr;
     auto* network = MakeSection(this, "Network", &networkSizer);
-    networkSizer->Add(MakeDisabledItem(network, "System proxy",
-                                       "Register the OS proxy settings", "Not implemented"),
-                      0, wxEXPAND);
+    auto* systemProxyRow = new wxBoxSizer(wxHORIZONTAL);
+    systemProxyRow->Add(new TextBlock(network, "System proxy", TypeStyle::Body), 0,
+                        wxALIGN_CENTER_VERTICAL);
+    systemProxyRow->AddStretchSpacer();
+    systemProxy_ = new Switch(network);
+    systemProxy_->SetOnChange([this](bool value) {
+        Controller().SetSystemProxyEnabled(value);
+        systemProxy_->SetValue(Controller().Snapshot().systemProxyEnabled, false);
+    });
+    systemProxyRow->Add(systemProxy_, 0, wxALIGN_CENTER_VERTICAL);
+    networkSizer->Add(systemProxyRow, 0, wxEXPAND);
+    systemProxyStatus_ = new TextBlock(network, "Off", TypeStyle::Label, 170);
+    networkSizer->Add(systemProxyStatus_, 0, wxEXPAND | wxTOP, FromDIP(SpaceDp(Space::Xs)));
+    pages::AddSpacer(networkSizer, network, SpaceDp(Space::Md));
     networkSizer->Add(MakeDisabledItem(network, "TUN mode", "Virtual network adapter",
                                        "Not implemented"),
                       0, wxEXPAND);
@@ -322,6 +333,20 @@ void SettingsPage::ApplyState(const app::AppStateSnapshot& state) {
     }
     animations_->SetValue(state.animationsEnabled, false);
     reducedMotion_->SetValue(state.reducedMotion, false);
+    if (systemProxy_ != nullptr) {
+        systemProxy_->SetValue(state.systemProxyEnabled, false);
+    }
+    if (systemProxyStatus_ != nullptr) {
+        if (state.systemProxyActive) {
+            systemProxyStatus_->SetText(wxString::FromUTF8(
+                "Active at " + state.systemProxyAddress +
+                ". The previous OS proxy is restored when the kernel stops."));
+        } else if (state.systemProxyEnabled) {
+            systemProxyStatus_->SetText("Enabled; applies when the kernel is running.");
+        } else {
+            systemProxyStatus_->SetText("Off");
+        }
+    }
 
     if (kernelStatusLine_ != nullptr) {
         kernelStatusLine_->SetText("Kernel: " + app::KernelStateText(state.kernel) + "   ·   " +
@@ -344,6 +369,7 @@ void SettingsPage::SyncMihomoSettings() {
     apiPortField_->SetValue(wxString::Format("%d", settings.controllerPort));
     secretField_->SetValue(wxString::FromUTF8(settings.secret));
     autoStart_->SetValue(settings.autoStartKernel, false);
+    systemProxy_->SetValue(settings.enableSystemProxy, false);
     testUrlField_->SetValue(wxString::FromUTF8(settings.proxyTestUrl));
     testTimeoutField_->SetValue(wxString::Format("%d", settings.proxyTestTimeoutMs));
     installDirField_->SetValue(wxString::FromUTF8(settings.kernelInstallDir));
@@ -483,6 +509,7 @@ void SettingsPage::SaveMihomoSettings() {
     settings.proxyTestTimeoutMs = static_cast<int>(testTimeout);
     settings.kernelInstallDir = installDirField_->GetValue().utf8_string();
     settings.downloadProxy = downloadProxyField_->GetValue().utf8_string();
+    settings.enableSystemProxy = systemProxy_->GetValue();
 
     wxString error;
     bool restartRequired = false;

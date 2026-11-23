@@ -17,6 +17,13 @@ core::Result<HttpTextResponse> HttpGetText(const std::string&, const HttpHeaders
     return Unsupported();
 }
 
+bool HttpsTextAvailable() noexcept { return false; }
+
+core::Result<HttpTextResponse> HttpGetBoundedHttpsText(
+    const std::string&, const std::string&, const HttpsTextLimits&, std::atomic<bool>&) {
+    return Unsupported();
+}
+
 core::Result<void> HttpDownloadFile(const std::string&, const std::string&,
                                     const std::string&, const DownloadProgress&,
                                     std::atomic<bool>&) {

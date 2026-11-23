@@ -19,7 +19,7 @@ void AddRow(wxSizer* sizer, wxWindow* parent, const wxString& label, TextBlock*&
     row->Add(new TextBlock(parent, label, TypeStyle::Label, 170), 0, wxALIGN_CENTER_VERTICAL);
     value = new TextBlock(parent, initial, TypeStyle::Body);
     value->SetAlignment(wxALIGN_RIGHT);
-    row->Add(value, 1, wxALIGN_CENTER_VERTICAL | wxEXPAND);
+    row->Add(value, 1, wxEXPAND);
     sizer->Add(row, 0, wxEXPAND);
 }
 
@@ -54,9 +54,11 @@ OverviewPage::OverviewPage(wxWindow* parent, app::AppController& controller)
 
     auto* profileCard = pages::MakeCard(this);
     auto* profileSizer = new wxBoxSizer(wxVERTICAL);
-    profileSizer->Add(pages::MakeSectionTitle(profileCard, "Active profile"), 0, wxEXPAND);
+    profileSizer->Add(pages::MakeSectionTitle(profileCard, "Profiles"), 0, wxEXPAND);
     pages::AddSpacer(profileSizer, profileCard, SpaceDp(Space::Md));
-    AddRow(profileSizer, profileCard, "Profile", profileValue_, "No profile loaded");
+    AddRow(profileSizer, profileCard, "Running", profileValue_, "None");
+    RowGap(profileSizer, profileCard);
+    AddRow(profileSizer, profileCard, "Next start", nextProfileValue_, "Unavailable");
     RowGap(profileSizer, profileCard);
     AddRow(profileSizer, profileCard, "Mode", modeValue_, "Rule");
     profileCard->SetContent(profileSizer, 20);
@@ -136,8 +138,22 @@ void OverviewPage::ApplyState(const app::AppStateSnapshot& state) {
     kernelValue_->SetText(app::KernelStateText(state.kernel));
     apiValue_->SetText(app::ApiStateText(state.api));
     versionValue_->SetText(app::FormatVersion(state.mihomoVersion));
-    profileValue_->SetText(state.profileLoaded ? wxString::FromUTF8(state.profileName)
-                                               : wxString("No profile loaded"));
+    const auto& profiles = state.profiles;
+    wxString runningProfile = "None";
+    wxString nextProfile = "Unavailable";
+    if (profiles) {
+        if (!profiles->runningProfileId.empty()) {
+            runningProfile = profiles->NameFor(profiles->runningProfileId, "Unknown");
+            if (profiles->runningCopyOutdated) {
+                runningProfile += " (update ready)";
+            }
+        }
+        if (!profiles->selectedProfileId.empty()) {
+            nextProfile = profiles->NameFor(profiles->selectedProfileId, "Missing profile");
+        }
+    }
+    profileValue_->SetText(runningProfile);
+    nextProfileValue_->SetText(nextProfile);
     modeValue_->SetText(app::ProxyModeText(state.proxyMode));
     uploadValue_->SetText(app::FormatSpeed(state.uploadBytesPerSecond, state.trafficAvailable));
     downloadValue_->SetText(
@@ -149,14 +165,15 @@ void OverviewPage::ApplyState(const app::AppStateSnapshot& state) {
                                      ? "Live traffic from the Mihomo event stream."
                                      : "Waiting for the traffic event stream..."));
 
-    startButton_->Enable(state.kernel == app::KernelState::NotStarted ||
-                         state.kernel == app::KernelState::Error);
+    const bool canLaunch = profiles && profiles->storeError.empty() && !profiles->switching;
+    startButton_->Enable(canLaunch && (state.kernel == app::KernelState::NotStarted ||
+                                      state.kernel == app::KernelState::Error));
     stopButton_->Enable(state.kernel == app::KernelState::Starting ||
                         state.kernel == app::KernelState::WaitingForApi ||
                         state.kernel == app::KernelState::Running);
-    restartButton_->Enable(state.kernel == app::KernelState::NotStarted ||
-                           state.kernel == app::KernelState::Running ||
-                           state.kernel == app::KernelState::Error);
+    restartButton_->Enable(canLaunch && (state.kernel == app::KernelState::NotStarted ||
+                                        state.kernel == app::KernelState::Running ||
+                                        state.kernel == app::KernelState::Error));
 
     const bool hasError = !state.kernelError.empty();
     errorLabel_->SetText(wxString::FromUTF8(state.kernelError));
@@ -167,7 +184,7 @@ void OverviewPage::ApplyState(const app::AppStateSnapshot& state) {
     const std::string signature =
         std::to_string(static_cast<int>(state.kernel)) + "|" +
         std::to_string(static_cast<int>(state.api)) + "|" + state.mihomoVersion + "|" +
-        state.profileName + "|" + std::to_string(state.profileLoaded) + "|" +
+        runningProfile.utf8_string() + "|" + nextProfile.utf8_string() + "|" +
         std::to_string(static_cast<int>(state.proxyMode)) + "|" + state.kernelError;
     if (signature != layoutSignature_) {
         layoutSignature_ = signature;

@@ -14,14 +14,6 @@ using core::Error;
 using core::ErrorKind;
 using core::MakeError;
 
-std::string Truncate(std::string value, std::size_t limit = 512) {
-    if (value.size() > limit) {
-        value.resize(limit);
-        value += "...";
-    }
-    return value;
-}
-
 core::Result<std::string> Request(const MihomoApiConfig& config, const char* method,
                                   const std::string& path, const std::string& body = {},
                                   const char* content_type = nullptr) {
@@ -103,9 +95,7 @@ core::Result<std::string> Request(const MihomoApiConfig& config, const char* met
                          status);
     }
     if (status < 200 || status >= 300) {
-        return MakeError(ErrorKind::HttpStatus,
-                         "unexpected HTTP status " + std::to_string(status) + ": " +
-                             Truncate(result->body),
+        return MakeError(ErrorKind::HttpStatus, "unexpected HTTP status " + std::to_string(status),
                          status);
     }
 
@@ -120,11 +110,12 @@ core::Result<nlohmann::json> RequestJson(const MihomoApiConfig& config, const ch
         return response.error();
     }
 
-    nlohmann::json json = nlohmann::json::parse(response.value(), nullptr, false);
-    if (json.is_discarded()) {
+    try {
+        return nlohmann::json::parse(response.value());
+    } catch (const nlohmann::json::exception&) {
+        // JSON exception messages can include snippets of the response.
         return MakeError(ErrorKind::InvalidJson, "response is not valid JSON");
     }
-    return json;
 }
 
 }  // namespace

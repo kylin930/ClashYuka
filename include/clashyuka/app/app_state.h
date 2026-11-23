@@ -4,6 +4,9 @@
 #include <string>
 #include <vector>
 
+#include <wx/string.h>
+
+#include "clashyuka/runtime/profile_store.h"
 #include "clashyuka/ui/theme/theme_manager.h"
 
 namespace clashyuka::runtime {
@@ -28,6 +31,32 @@ enum class ApiState { Disconnected, Connecting, Connected };
 
 enum class ProxyMode { Rule, Global, Direct };
 
+struct ProfileRow {
+    std::string id;
+    std::string name;
+    runtime::ProfileKind kind;
+    runtime::ProfileRefreshOutcome refreshOutcome;
+    long long refreshCompletedAt;
+    bool refreshing;
+
+    bool operator==(const ProfileRow&) const = default;
+};
+
+struct ProfilesSnapshot {
+    std::vector<ProfileRow> rows;
+    std::string selectedProfileId;
+    std::string runningProfileId;
+    std::string storeError;
+    std::string actionStatus;
+    bool subscriptionsAvailable = false;
+    bool addingSubscription = false;
+    bool switching = false;
+    bool runningCopyOutdated = false;
+
+    wxString NameFor(const std::string& id, const wxString& fallback) const;
+    bool operator==(const ProfilesSnapshot&) const = default;
+};
+
 // Immutable-looking snapshot consumed by the shell, pages and (later) the
 // Mihomo integration. The controller is the only component that mutates it.
 struct AppStateSnapshot {
@@ -42,8 +71,7 @@ struct AppStateSnapshot {
 
     ProxyMode proxyMode = ProxyMode::Rule;
 
-    std::string profileName;
-    bool profileLoaded = false;
+    std::shared_ptr<const ProfilesSnapshot> profiles;
     std::string mihomoVersion;
 
     double uploadBytesPerSecond = 0.0;
@@ -61,6 +89,10 @@ struct AppStateSnapshot {
     // even for large proxy collections.
     std::shared_ptr<const runtime::ProxyCatalog> proxyCatalog;
     std::shared_ptr<const runtime::KernelUpdateSnapshot> kernelUpdate;
+
+    bool systemProxyEnabled = false;
+    bool systemProxyActive = false;
+    std::string systemProxyAddress;
 };
 
 class AppStateObserver {
@@ -86,7 +118,7 @@ public:
     void SetAnimationsEnabled(bool enabled);
     void SetReducedMotion(bool reduced);
     void SetProxyMode(ProxyMode mode);
-    void SetProfile(std::string name, bool loaded);
+    void SetProfiles(ProfilesSnapshot profiles);
     void SetMihomoVersion(std::string version);
     void SetTraffic(double uploadBytesPerSecond, double downloadBytesPerSecond, bool available);
     void SetConnectionCount(int count);
@@ -95,6 +127,7 @@ public:
     void SetKernelError(std::string error);
     void SetProxyCatalog(std::shared_ptr<const runtime::ProxyCatalog> catalog);
     void SetKernelUpdate(std::shared_ptr<const runtime::KernelUpdateSnapshot> update);
+    void SetSystemProxy(bool enabled, bool active, std::string address);
 
 private:
     void Notify();

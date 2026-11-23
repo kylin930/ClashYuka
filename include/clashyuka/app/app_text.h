@@ -75,6 +75,9 @@ inline wxString KernelErrorText(core::ErrorKind kind) {
         case core::ErrorKind::ConfigFailed:
             return wxString::FromUTF8(
                 "The runtime configuration could not be prepared. Check the settings and try again.");
+        case core::ErrorKind::ProfilePreflightRejected:
+            return wxString::FromUTF8(
+                "Mihomo rejected the profile configuration. Check the profile or select another one.");
         case core::ErrorKind::AuthFailed:
             return wxString::FromUTF8(
                 "The Mihomo API rejected the secret. Update the secret in Settings.");

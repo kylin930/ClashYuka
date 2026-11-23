@@ -26,6 +26,7 @@ enum class ErrorKind {
     ChecksumMismatch,
     ExtractFailed,
     Internal,
+    ProfilePreflightRejected,
 };
 
 struct Error {

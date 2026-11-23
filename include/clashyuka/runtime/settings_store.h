@@ -26,6 +26,9 @@ struct AppSettings {
     std::string kernelInstallDir;
     // Empty means "use the system proxy".
     std::string downloadProxy;
+
+    // Apply the OS HTTP/HTTPS proxy while the kernel is running.
+    bool enableSystemProxy = false;
 };
 
 struct SettingsLoadResult {

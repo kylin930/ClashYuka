@@ -15,6 +15,7 @@ using nlohmann::json;
 namespace {
 
 constexpr const char* kSecret = "test-secret-2f7c1d";
+constexpr const char* kResponseMarker = "controller-response-marker";
 
 bool HasValidBearer(const httplib::Request& request) {
     return request.get_header_value("Authorization") == std::string("Bearer ") + kSecret;
@@ -43,6 +44,7 @@ struct ApiFixture {
         srv.Get("/version", [this](const httplib::Request& request, httplib::Response& response) {
             if (!HasValidBearer(request)) {
                 response.status = 401;
+                response.set_content(kResponseMarker, "text/plain");
                 return;
             }
             if (slowVersion.load()) {
@@ -50,11 +52,11 @@ struct ApiFixture {
             }
             if (failVersion.load()) {
                 response.status = 500;
-                response.set_content("internal error", "text/plain");
+                response.set_content(kResponseMarker, "text/plain");
                 return;
             }
             if (invalidJsonVersion.load()) {
-                response.set_content("not-json", "application/json");
+                response.set_content(std::string("\"") + kResponseMarker, "application/json");
                 return;
             }
             response.set_content(R"({"version":"1.19.20","meta":true})", "application/json");
@@ -299,6 +301,7 @@ TEST_CASE("Mihomo API client maps authentication and HTTP errors") {
     REQUIRE_FALSE(unauthorized);
     CHECK(unauthorized.error().kind == core::ErrorKind::AuthFailed);
     CHECK(unauthorized.error().httpStatus == 401);
+    CHECK(unauthorized.error().message == "authentication rejected by the controller");
 
     fixture.failVersion.store(true);
     mihomo::MihomoApiClient client(fixture.Config());
@@ -306,6 +309,7 @@ TEST_CASE("Mihomo API client maps authentication and HTTP errors") {
     REQUIRE_FALSE(failed);
     CHECK(failed.error().kind == core::ErrorKind::HttpStatus);
     CHECK(failed.error().httpStatus == 500);
+    CHECK(failed.error().message == "unexpected HTTP status 500");
 }
 
 TEST_CASE("Mihomo API client maps invalid JSON and missing fields") {
@@ -317,6 +321,7 @@ TEST_CASE("Mihomo API client maps invalid JSON and missing fields") {
     auto invalid = client.GetVersion();
     REQUIRE_FALSE(invalid);
     CHECK(invalid.error().kind == core::ErrorKind::InvalidJson);
+    CHECK(invalid.error().message == "response is not valid JSON");
 
     fixture.invalidJsonVersion.store(false);
     fixture.emptyProxies.store(true);

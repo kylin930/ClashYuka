@@ -7,6 +7,7 @@
 
 #include "clashyuka/app/app_controller.h"
 #include "clashyuka/app/app_state.h"
+#include "clashyuka/app/app_text.h"
 #include "clashyuka/app/page_registry.h"
 #include "clashyuka/ui/theme/theme_manager.h"
 
@@ -42,6 +43,13 @@ public:
 
 }  // namespace
 
+TEST_CASE("kernel error text distinguishes preflight rejection from config preparation failure") {
+    CHECK(KernelErrorText(core::ErrorKind::ProfilePreflightRejected) ==
+          "Mihomo rejected the profile configuration. Check the profile or select another one.");
+    CHECK(KernelErrorText(core::ErrorKind::ConfigFailed) ==
+          "The runtime configuration could not be prepared. Check the settings and try again.");
+}
+
 TEST_CASE("app state starts in the disconnected shell state") {
     AppState state;
     const AppStateSnapshot& snapshot = state.Get();
@@ -53,7 +61,7 @@ TEST_CASE("app state starts in the disconnected shell state") {
     CHECK(snapshot.animationsEnabled);
     CHECK_FALSE(snapshot.reducedMotion);
     CHECK(snapshot.proxyMode == ProxyMode::Rule);
-    CHECK_FALSE(snapshot.profileLoaded);
+    CHECK_FALSE(snapshot.profiles);
     CHECK_FALSE(snapshot.trafficAvailable);
     CHECK(snapshot.connectionCount == 0);
 }
@@ -72,12 +80,18 @@ TEST_CASE("app state notifies observers and skips unchanged values") {
 
     state.SetApiState(ApiState::Connecting);
     state.SetProxyMode(ProxyMode::Global);
-    state.SetProfile("demo.yaml", true);
+    ProfilesSnapshot profiles;
+    profiles.selectedProfileId = "builtin";
+    profiles.runningProfileId = "local-id";
+    state.SetProfiles(profiles);
+    state.SetProfiles(profiles);
     state.SetTraffic(1024.0, 2048.0, true);
     CHECK(observer.calls == 5);
     CHECK(observer.last.api == ApiState::Connecting);
     CHECK(observer.last.proxyMode == ProxyMode::Global);
-    CHECK(observer.last.profileName == "demo.yaml");
+    REQUIRE(observer.last.profiles);
+    CHECK(observer.last.profiles->selectedProfileId == "builtin");
+    CHECK(observer.last.profiles->runningProfileId == "local-id");
     CHECK(observer.last.trafficAvailable);
 }
 

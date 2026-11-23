@@ -1,6 +1,9 @@
 #pragma once
 
+#include <filesystem>
+#include <memory>
 #include <string>
+#include <string_view>
 
 #include "clashyuka/core/result.h"
 
@@ -21,7 +24,7 @@ struct RuntimeConfigDefinition {
 struct RuntimeConfigInfo {
     std::string host = "127.0.0.1";
     int port = 9090;
-    int mixedPort = 7897;
+    int mixedPort = 0;
     std::string secret;
     bool generated = false;
 };
@@ -37,5 +40,26 @@ std::string RenderRuntimeConfig(const RuntimeConfigDefinition& definition);
 // - User-provided file (no marker): validated and adopted, never overwritten.
 core::Result<RuntimeConfigInfo> EnsureRuntimeConfig(const std::string& path,
                                                     const RuntimeConfigDefinition& definition);
+
+// A unique, session-owned launch copy. Removing it never touches the source.
+struct RuntimeConfigCopy {
+    explicit RuntimeConfigCopy(std::filesystem::path directory);
+    ~RuntimeConfigCopy();
+    RuntimeConfigCopy(const RuntimeConfigCopy&) = delete;
+    RuntimeConfigCopy& operator=(const RuntimeConfigCopy&) = delete;
+
+    std::filesystem::path directory;
+    std::string configPath;
+    std::string workingDirectory;
+    RuntimeConfigInfo info;
+};
+
+core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeProfileRuntimeCopy(
+    const std::string& workingDirectory, std::string_view bytes,
+    const RuntimeConfigDefinition& definition);
+
+core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeLegacyRuntimeCopy(
+    const std::string& workingDirectory, const std::string& configPath,
+    const RuntimeConfigDefinition& definition);
 
 }  // namespace clashyuka::runtime

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -24,6 +26,18 @@ using DownloadProgress = std::function<void(std::uint64_t downloaded, std::uint6
 core::Result<HttpTextResponse> HttpGetText(const std::string& url, const HttpHeaders& headers,
                                            const std::string& proxyUrl,
                                            std::atomic<bool>& cancel);
+
+struct HttpsTextLimits {
+    std::size_t maxBytes = 4 * 1024 * 1024;
+    std::chrono::milliseconds timeout{30000};  // Whole request, including redirects.
+};
+
+bool HttpsTextAvailable() noexcept;
+// Verified HTTPS only, including redirects. Non-2xx responses carry no body.
+// Empty proxyUrl uses the system proxy. Size errors are InvalidConfig.
+core::Result<HttpTextResponse> HttpGetBoundedHttpsText(
+    const std::string& url, const std::string& proxyUrl, const HttpsTextLimits& limits,
+    std::atomic<bool>& cancel);
 
 // Streams a URL to targetPath. proxyUrl empty means "use the system proxy".
 // TLS certificates are always verified; redirects are followed.

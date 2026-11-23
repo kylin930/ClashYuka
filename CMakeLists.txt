@@ -44,16 +44,19 @@ if(WIN32)
   set(CLASHYUKA_PLATFORM_SOURCES
     src/platform/windows/platform_services_windows.cpp
     src/platform/windows/http_download_windows.cpp
+    src/platform/windows/system_proxy_windows.cpp
   )
 elseif(APPLE)
   set(CLASHYUKA_PLATFORM_SOURCES
     src/platform/macos/platform_services_macos.cpp
     src/platform/posix/http_download_posix.cpp
+    src/platform/posix/system_proxy_posix.cpp
   )
 elseif(UNIX)
   set(CLASHYUKA_PLATFORM_SOURCES
     src/platform/linux/platform_services_linux.cpp
     src/platform/posix/http_download_posix.cpp
+    src/platform/posix/system_proxy_posix.cpp
   )
 else()
   message(FATAL_ERROR "ClashYuka does not support this platform yet.")
@@ -63,7 +66,7 @@ add_library(clashyuka_platform STATIC ${CLASHYUKA_PLATFORM_SOURCES})
 target_include_directories(clashyuka_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(clashyuka_platform PUBLIC clashyuka_options)
 if(WIN32)
-  target_link_libraries(clashyuka_platform PUBLIC advapi32 winhttp)
+  target_link_libraries(clashyuka_platform PUBLIC advapi32 winhttp wininet)
 endif()
 
 add_library(clashyuka_core STATIC
@@ -128,6 +131,8 @@ target_link_libraries(clashyuka_process PUBLIC clashyuka_options Threads::Thread
 # --- Runtime orchestration (settings, runtime config, kernel session) --------
 add_library(clashyuka_runtime STATIC
   src/runtime/settings_store.cpp
+  src/runtime/profile_store.cpp
+  src/runtime/subscription_service.cpp
   src/runtime/runtime_config.cpp
   src/runtime/kernel_session.cpp
   src/runtime/proxy_service.cpp
@@ -246,6 +251,10 @@ if(CLASHYUKA_BUILD_TESTS)
     tests/test_event_client.cpp
     tests/test_http_download.cpp
   )
+  if(WIN32)
+    target_sources(clashyuka_tests PRIVATE tests/test_system_proxy.cpp)
+    target_link_libraries(clashyuka_tests PRIVATE crypt32 secur32)
+  endif()
   target_include_directories(clashyuka_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(clashyuka_tests PRIVATE
     clashyuka_core
@@ -280,6 +289,20 @@ if(CLASHYUKA_BUILD_TESTS)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   add_test(NAME clashyuka_runtime_tests COMMAND clashyuka_runtime_tests)
+
+  add_executable(clashyuka_profile_tests tests/test_profile_store.cpp)
+  target_link_libraries(clashyuka_profile_tests PRIVATE clashyuka_runtime doctest::doctest)
+  set_target_properties(clashyuka_profile_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  add_test(NAME clashyuka_profile_tests COMMAND clashyuka_profile_tests)
+
+  add_executable(clashyuka_subscription_tests tests/test_subscription_service.cpp)
+  target_link_libraries(clashyuka_subscription_tests PRIVATE clashyuka_runtime doctest::doctest)
+  set_target_properties(clashyuka_subscription_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  add_test(NAME clashyuka_subscription_tests COMMAND clashyuka_subscription_tests)
 
   add_executable(clashyuka_proxy_tests tests/test_proxy_service.cpp)
   target_link_libraries(clashyuka_proxy_tests PRIVATE

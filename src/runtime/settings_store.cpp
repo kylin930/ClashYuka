@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 using core::ErrorKind;
 using core::MakeError;
 
-constexpr int kSettingsVersion = 2;
+constexpr int kSettingsVersion = 3;
 
 fs::path PathFromUtf8(const std::string& value) {
     return fs::path(std::u8string(value.begin(), value.end()));
@@ -69,6 +69,7 @@ core::Result<void> WriteSettingsFile(const fs::path& path, const AppSettings& se
     root["proxyTestTimeoutMs"] = settings.proxyTestTimeoutMs;
     root["kernelInstallDir"] = settings.kernelInstallDir;
     root["downloadProxy"] = settings.downloadProxy;
+    root["enableSystemProxy"] = settings.enableSystemProxy;
 
     {
         std::ofstream output(temp, std::ios::binary | std::ios::trunc);
@@ -170,6 +171,7 @@ SettingsLoadResult LoadSettings(const std::string& path) {
     partial |= !ReadInt(root, "proxyTestTimeoutMs", settings.proxyTestTimeoutMs);
     partial |= !ReadString(root, "kernelInstallDir", settings.kernelInstallDir);
     partial |= !ReadString(root, "downloadProxy", settings.downloadProxy);
+    partial |= !ReadBool(root, "enableSystemProxy", settings.enableSystemProxy);
 
     if (settings.secret.empty()) {
         settings.secret = GenerateLocalSecret();

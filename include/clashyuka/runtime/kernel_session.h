@@ -30,6 +30,23 @@ enum class KernelPhase {
 
 const char* KernelPhaseName(KernelPhase phase);
 
+// Resolve imported bytes on the ProfileStore owner thread before submitting.
+// A disengaged yaml means the built-in/legacy runtime configuration.
+struct KernelProfile {
+    std::string id = "builtin";
+    std::optional<std::string> yaml;
+};
+
+enum class ProfileSwitchOutcome { Succeeded, Rejected, RolledBack, RollbackFailed, Cancelled };
+
+struct ProfileSwitchResult {
+    std::uint64_t requestId = 0;
+    std::string oldProfileId;
+    std::string newProfileId;
+    ProfileSwitchOutcome outcome = ProfileSwitchOutcome::Cancelled;
+    core::Error error;
+};
+
 struct KernelOptions {
     std::string executablePath;
     std::string workingDirectory;
@@ -47,6 +64,8 @@ struct KernelOptions {
 
     bool connectTraffic = true;
     bool connectConnections = true;
+    KernelProfile profile;
+    int preflightTimeoutMs = 5000;
 };
 
 struct KernelSnapshot {
@@ -56,9 +75,14 @@ struct KernelSnapshot {
     std::string apiAddress;
     std::string configPath;
     bool generatedConfig = false;
+    int mixedPort = 0;
     core::Error error;
     // Recoverable event-stream failure. The kernel keeps running.
     std::string eventError;
+    std::string runningProfileId;
+    bool profileSwitchInProgress = false;
+    // Last terminal switch result. Deduplicate by requestId; Running alone is not success.
+    std::optional<ProfileSwitchResult> profileSwitchResult;
 };
 
 class KernelSessionObserver {
@@ -134,6 +158,9 @@ public:
     void Start();
     void Stop();
     void Restart();
+    // Running-only. A rejected submission returns nullopt and has no terminal result.
+    // Stop cancels an accepted switch; Restart is ignored while one is pending.
+    std::optional<std::uint64_t> SwitchProfile(KernelProfile profile);
     void Shutdown();
 
     KernelPhase Phase() const;
@@ -144,10 +171,14 @@ public:
 
 private:
     struct SharedState;
-    enum class CommandType { Start, Stop, Restart, ProcessExited };
+    struct LaunchConfig;
+    struct ProcessStatus;
+    enum class CommandType { Start, Stop, Restart, SwitchProfile, ProcessExited };
     struct Command {
         CommandType type = CommandType::Start;
         std::uint64_t generation = 0;
+        KernelOptions options;
+        ProfileSwitchResult profileSwitch;
     };
 
     void Enqueue(Command command);
@@ -156,6 +187,12 @@ private:
     void HandleStop(std::uint64_t generation);
     void HandleRestart(std::uint64_t generation);
     void HandleProcessExited(std::uint64_t generation);
+    void HandleProfileSwitch(Command command);
+    void FinishProfileSwitch(ProfileSwitchResult result);
+    core::Result<std::unique_ptr<LaunchConfig>> PrepareLaunch(KernelOptions options, bool switching);
+    core::Result<void> Preflight(const LaunchConfig& config);
+    core::Result<void> Launch(std::uint64_t generation, const LaunchConfig& config,
+                              ProfileSwitchResult* readyResult = nullptr);
     void HandleShutdown();
     void BeginStartSession(std::uint64_t& generation);
     void Fail(std::uint64_t generation, core::ErrorKind kind, std::string message);
@@ -187,10 +224,10 @@ private:
     bool workerExited_ = false;
 
     std::atomic<bool> cancelRequested_{false};
-    std::atomic<bool> processExited_{false};
-    std::atomic<int> processExitCode_{0};
 
     // Worker-thread-only objects.
+    std::unique_ptr<LaunchConfig> activeConfig_;
+    std::shared_ptr<ProcessStatus> processStatus_;
     std::unique_ptr<KernelProcessDriver> process_;
     std::unique_ptr<KernelApiDriver> api_;
     std::unique_ptr<KernelEventDriver> events_;

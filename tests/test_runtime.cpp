@@ -110,6 +110,7 @@ TEST_CASE("settings round trip through JSON") {
     settings.controllerPort = 19090;
     settings.mixedPort = 17897;
     settings.autoStartKernel = true;
+    settings.enableSystemProxy = true;
 
     const core::Result<void> saved = runtime::SaveSettings(path, settings);
     REQUIRE(saved.ok());
@@ -121,6 +122,7 @@ TEST_CASE("settings round trip through JSON") {
     CHECK(loaded.settings.controllerPort == 19090);
     CHECK(loaded.settings.mixedPort == 17897);
     CHECK(loaded.settings.autoStartKernel);
+    CHECK(loaded.settings.enableSystemProxy);
     CHECK(loaded.settings.secret == settings.secret);
 }
 
@@ -239,6 +241,19 @@ TEST_CASE("an existing user config is adopted without being overwritten") {
     CHECK_FALSE(info.value().generated);
     CHECK(info.value().port == 19999);
     CHECK(info.value().secret == "user-secret");
+    CHECK(info.value().mixedPort == 7890);
+    CHECK(ReadFile(file) == original);
+}
+
+TEST_CASE("a user config without a mixed port does not inherit the app default") {
+    TempDir dir;
+    const fs::path file = dir.path / "user.yaml";
+    const std::string original = "external-controller: 127.0.0.1:19999\n";
+    WriteFile(file, original);
+
+    const auto info = runtime::EnsureRuntimeConfig(ToUtf8(file), {});
+    REQUIRE(info.ok());
+    CHECK(info.value().mixedPort == 0);
     CHECK(ReadFile(file) == original);
 }
 
@@ -318,6 +333,11 @@ struct FakeKernel {
     mutable std::mutex mutex;
     std::atomic<int> processStarts{0};
     std::atomic<int> processStops{0};
+    std::atomic<int> preflightStarts{0};
+    std::atomic<int> preflightStops{0};
+    std::atomic<int> preflightCode{0}; // Negative simulates a hung check.
+    std::atomic<bool> capturedImportedOutput{false};
+    std::vector<std::string> liveConfigs;
     std::atomic<int> apiCalls{0};
     std::atomic<int> trafficConnects{0};
     std::atomic<int> connectionConnects{0};
@@ -390,12 +410,27 @@ public:
 
     bool Start(const mihomo::MihomoLaunchOptions& options,
                mihomo::MihomoProcessHandlers handlers) override {
+        preflight_ = !options.arguments.empty() && options.arguments[0] == "-t";
+        if (preflight_) {
+            fake_->preflightStarts.fetch_add(1);
+            code_ = fake_->preflightCode.load();
+            if (handlers.onStdoutLine || handlers.onStderrLine) {
+                fake_->capturedImportedOutput.store(true);
+            }
+            return true;
+        }
         bool result = true;
         int exitCode = -1;
         {
             std::lock_guard<std::mutex> lock(fake_->mutex);
             fake_->processStarts.fetch_add(1);
             fake_->lastLaunch = options;
+            const auto path = FromUtf8(options.arguments.back());
+            fake_->liveConfigs.push_back(ReadFile(path));
+            if (options.arguments[1] == ToUtf8(path.parent_path()) &&
+                (handlers.onStdoutLine || handlers.onStderrLine)) {
+                fake_->capturedImportedOutput.store(true);
+            }
             result = fake_->processStartResult;
             fake_->running = result;
             fake_->exitHandler = handlers.onExited;
@@ -408,6 +443,10 @@ public:
     }
 
     void Stop() override {
+        if (preflight_) {
+            fake_->preflightStops.fetch_add(1);
+            return;
+        }
         std::lock_guard<std::mutex> lock(fake_->mutex);
         fake_->processStops.fetch_add(1);
         fake_->running = false;
@@ -419,10 +458,14 @@ public:
         return fake_->running;
     }
 
-    std::optional<int> ExitCode() const override { return std::nullopt; }
+    std::optional<int> ExitCode() const override {
+        return preflight_ && code_ >= 0 ? std::optional<int>{code_} : std::nullopt;
+    }
 
 private:
     std::shared_ptr<FakeKernel> fake_;
+    bool preflight_ = false;
+    int code_ = -1;
 };
 
 class FakeApiDriver final : public runtime::KernelApiDriver {
@@ -869,6 +912,287 @@ TEST_CASE("live traffic and connection counts reach the observer") {
         return !harness.observer.connections.empty() &&
                harness.observer.connections.back() == 3;
     }));
+}
+
+TEST_CASE("imported copies isolate ingress and preserve group behavior") {
+    TempDir dir;
+    const std::string original = R"(allow-lan: true
+bind-address: '*'
+mixed-port: 1
+port: 2
+socks-port: 3
+redir-port: 4
+tproxy-port: 5
+listeners: [{name: bad, type: socks, port: 6}]
+tun: {enable: true}
+external-controller: '0.0.0.0:1111'
+external-controller-tls: '0.0.0.0:2222'
+external-controller-unix: alternate.sock
+external-controller-pipe: alternate-pipe
+external-controller-cors: {allow-origins: ['*']}
+secret: imported-secret
+dns: {enable: true, listen: '0.0.0.0:53', nameserver: [1.1.1.1]}
+proxy-providers:
+  remote: {type: http, url: 'https://example.test/provider', path: configs/source.yaml}
+proxy-groups:
+  - {name: Pick, type: url-test, proxies: [DIRECT], use: [remote], interval: 99}
+rules: ['MATCH,Pick']
+)";
+    const auto home = ToUtf8(dir.path / fs::path(u8"配置"));
+    const auto source = dir.path / "source.yaml";
+    WriteFile(source, original);
+    RuntimeConfigDefinition definition;
+    definition.secret = "app-secret";
+    auto first = MakeProfileRuntimeCopy(home, ReadFile(source), definition);
+    auto second = MakeProfileRuntimeCopy(home, ReadFile(source), definition);
+    REQUIRE(first.ok());
+    REQUIRE(second.ok());
+    const auto path = FromUtf8(first.value()->configPath);
+    CHECK(first.value()->configPath != second.value()->configPath);
+    CHECK(path.parent_path() == FromUtf8(first.value()->workingDirectory));
+    const auto contents = ReadFile(path);
+    const auto root = YAML::Load(contents);
+    for (const auto* key : {"port", "socks-port", "redir-port", "tproxy-port", "listeners", "tun",
+                             "external-controller-tls", "external-controller-unix",
+                             "external-controller-pipe", "external-controller-cors"}) {
+        CHECK_FALSE(root[key]);
+    }
+    CHECK_FALSE(root["allow-lan"].as<bool>());
+    CHECK(root["bind-address"].Scalar() == "127.0.0.1");
+    CHECK(root["external-controller"].Scalar() == "127.0.0.1:9090");
+    CHECK(root["mixed-port"].as<int>() == 7897);
+    CHECK(root["secret"].Scalar() == "app-secret");
+    CHECK_FALSE(root["dns"]["listen"]);
+    CHECK(root["dns"]["enable"].as<bool>());
+    CHECK_FALSE(root["proxy-providers"]["remote"]["path"]);
+    CHECK(root["proxy-groups"][0]["type"].Scalar() == "url-test");
+    CHECK(root["proxy-groups"][0]["use"][0].Scalar() == "remote");
+    CHECK(root["rules"][0].Scalar() == "MATCH,Pick");
+    CHECK(ReadFile(source) == original);
+    first.value().reset();
+    CHECK_FALSE(fs::exists(path));
+}
+
+TEST_CASE("runtime isolation rejects dependencies without disclosing paths") {
+    TempDir dir;
+    const auto home = ToUtf8(dir.path);
+    for (const auto* yaml : {
+             "proxy-providers: {test: {type: file, path: secret-file.yaml}}",
+             "geox-url: {geoip: secret-file.yaml}",
+             "proxies: [{name: remote, certificate: secret-file.yaml}]",
+             "proxies: [{name: remote, type: hysteria, ca: secret-file.yaml}]",
+             "proxy-providers: {inline: {type: inline, payload: [{certificate: secret-file.yaml}]}}",
+             "external-ui: secret-file.yaml",
+             "proxies: []\n---\nsecret: secret-file.yaml"}) {
+        const auto copy = MakeProfileRuntimeCopy(home, yaml, {});
+        REQUIRE_FALSE(copy.ok());
+        CHECK(copy.error().message.find("secret-file") == std::string::npos);
+    }
+    RuntimeConfigDefinition definition;
+    definition.host = "192.0.2.8";
+    CHECK_FALSE(MakeProfileRuntimeCopy(home, "{}", definition));
+    CHECK_FALSE(fs::exists(dir.path / "session-copies"));
+}
+
+std::optional<ProfileSwitchResult> WaitSwitch(Harness& harness, std::uint64_t requestId) {
+    std::optional<ProfileSwitchResult> found;
+    WaitUntil([&] {
+        const auto snapshot = harness.observer.Last();
+        if (snapshot.profileSwitchResult && snapshot.profileSwitchResult->requestId == requestId) {
+            found = snapshot.profileSwitchResult;
+        }
+        return found.has_value();
+    });
+    return found;
+}
+
+TEST_CASE("first imported startup preflights its own copy before publishing readiness") {
+    Harness harness;
+    auto options = harness.Options();
+    options.profile = {"local-one", "rules: ['MATCH,DIRECT']\nsecret: never-log-this"};
+    harness.SetOptions(options);
+    harness.fake->ConfigureApiFailures(1, 30);
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::WaitingForApi));
+    CHECK(harness.observer.Last().runningProfileId.empty());
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    CHECK(harness.observer.Last().runningProfileId == "local-one");
+    CHECK(harness.fake->preflightStarts == 1);
+    CHECK(harness.fake->preflightStops == 1);
+    CHECK(harness.fake->processStarts == 1);
+    CHECK_FALSE(harness.fake->capturedImportedOutput.load());
+    CHECK_FALSE(fs::exists(FromUtf8(options.configPath)));
+}
+
+TEST_CASE("first imported startup distinguishes preflight rejection from runtime copy failure") {
+    Harness harness;
+    auto options = harness.Options();
+    options.profile = {"local-one", "rules: ['MATCH,DIRECT']\nsecret: profile-marker"};
+    harness.SetOptions(options);
+
+    SUBCASE("Mihomo rejects the generated copy") {
+        harness.fake->preflightCode = 7;
+        harness.session->Start();
+        REQUIRE(harness.WaitPhase(KernelPhase::Failed));
+        const auto error = harness.observer.Last().error;
+        CHECK(error.kind == core::ErrorKind::ProfilePreflightRejected);
+        CHECK(error.message == "Mihomo rejected the profile configuration");
+        CHECK(harness.fake->preflightStarts == 1);
+        CHECK(harness.fake->preflightStops == 1);
+        CHECK_FALSE(harness.fake->capturedImportedOutput.load());
+    }
+    SUBCASE("the runtime copy directory cannot be created") {
+        WriteFile(harness.dir.path / "session-copies", "copy-directory-marker");
+        harness.session->Start();
+        REQUIRE(harness.WaitPhase(KernelPhase::Failed));
+        const auto error = harness.observer.Last().error;
+        CHECK(error.kind == core::ErrorKind::ConfigFailed);
+        CHECK(error.message == "could not create the runtime copy directory");
+        CHECK(harness.fake->preflightStarts == 0);
+    }
+    CHECK(harness.fake->processStarts == 0);
+    CHECK(harness.fake->apiCalls == 0);
+    CHECK(harness.observer.Last().runningProfileId.empty());
+}
+
+TEST_CASE("unavailable selected profile cannot fall back to a legacy config") {
+    Harness harness;
+    auto options = harness.Options();
+    options.profile = {"missing-profile", std::nullopt};
+    harness.SetOptions(options);
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Failed));
+    CHECK(harness.observer.Last().error.kind == core::ErrorKind::ConfigFailed);
+    CHECK(harness.fake->preflightStarts == 0);
+    CHECK(harness.fake->processStarts == 0);
+    CHECK_FALSE(fs::exists(FromUtf8(options.configPath)));
+}
+
+TEST_CASE("failed or timed-out preflight keeps the exact old session running") {
+    Harness harness;
+    auto options = harness.Options();
+    options.preflightTimeoutMs = 35;
+    harness.SetOptions(options);
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    const auto old = harness.observer.Last();
+    for (const int code : {7, -1}) {
+        harness.fake->preflightCode = code;
+        const auto request = harness.session->SwitchProfile({"new", "{}"});
+        REQUIRE(request);
+        const auto result = WaitSwitch(harness, *request);
+        REQUIRE(result);
+        CHECK(result->oldProfileId == "builtin");
+        CHECK(result->newProfileId == "new");
+        CHECK(result->outcome == ProfileSwitchOutcome::Rejected);
+        CHECK(result->error.kind == (code < 0 ? core::ErrorKind::Timeout
+                                             : core::ErrorKind::ProfilePreflightRejected));
+        CHECK(harness.observer.Last().phase == KernelPhase::Running);
+        CHECK(harness.observer.Last().generation == old.generation);
+        CHECK(harness.observer.Last().runningProfileId == "builtin");
+        CHECK(harness.fake->processStops == 0);
+    }
+    CHECK(harness.fake->preflightStops == 2);
+}
+
+TEST_CASE("switch success is tokenized and stale old process callbacks cannot undo it") {
+    Harness harness;
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    const auto old = harness.observer.Last();
+    std::function<void(int)> oldExit;
+    {
+        std::lock_guard lock(harness.fake->mutex);
+        oldExit = harness.fake->exitHandler;
+    }
+    harness.fake->ConfigureApiFailures(1, 30);
+    const auto request = harness.session->SwitchProfile({"new", "{}"});
+    REQUIRE(request);
+    REQUIRE(harness.WaitPhase(KernelPhase::WaitingForApi));
+    CHECK(harness.observer.Last().profileSwitchInProgress);
+    CHECK(harness.observer.Last().runningProfileId.empty());
+    CHECK_FALSE(harness.session->SwitchProfile({"duplicate", "{}"}));
+    REQUIRE(oldExit);
+    oldExit(17);
+    const auto result = WaitSwitch(harness, *request);
+    REQUIRE(result);
+    CHECK(result->outcome == ProfileSwitchOutcome::Succeeded);
+    CHECK(result->oldProfileId == "builtin");
+    CHECK(result->newProfileId == "new");
+    CHECK(harness.observer.Last().generation > old.generation);
+    CHECK(harness.observer.Last().runningProfileId == "new");
+    CHECK(harness.observer.Last().phase == KernelPhase::Running);
+    CHECK_FALSE(harness.observer.Last().profileSwitchInProgress);
+}
+
+TEST_CASE("candidate readiness failure rolls back exact bytes or reports rollback failure") {
+    Harness harness;
+    auto options = harness.Options();
+    options.readinessAttempts = 1;
+    harness.SetOptions(options);
+    const std::string old = "# user-managed\nexternal-controller: 127.0.0.1:19080\nmixed-port: 17443\n";
+    const auto source = FromUtf8(options.configPath);
+    WriteFile(source, old);
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    const auto oldPath = harness.observer.Last().configPath;
+    WriteFile(source, "# edited after startup\nexternal-controller: 127.0.0.1:19070\n");
+    bool rollbackFails = false;
+    SUBCASE("restore succeeds") { rollbackFails = false; }
+    SUBCASE("restore fails") { rollbackFails = true; }
+    harness.fake->ConfigureApiFailures(rollbackFails ? 2 : 1, 0);
+    const auto request = harness.session->SwitchProfile({"new", "rules: ['MATCH,DIRECT']"});
+    REQUIRE(request);
+    const auto result = WaitSwitch(harness, *request);
+    REQUIRE(result);
+    CHECK(result->outcome == (rollbackFails ? ProfileSwitchOutcome::RollbackFailed
+                                            : ProfileSwitchOutcome::RolledBack));
+    CHECK(result->oldProfileId == "builtin");
+    CHECK(result->newProfileId == "new");
+    CHECK(harness.observer.Last().phase == (rollbackFails ? KernelPhase::Failed : KernelPhase::Running));
+    CHECK(harness.observer.Last().runningProfileId == (rollbackFails ? "" : "builtin"));
+    CHECK(harness.fake->LastLaunch().arguments.back() == oldPath);
+    CHECK(ReadFile(source).find("edited after startup") != std::string::npos);
+    {
+        std::lock_guard lock(harness.fake->mutex);
+        REQUIRE(harness.fake->liveConfigs.size() == 3);
+        CHECK(harness.fake->liveConfigs[2] == harness.fake->liveConfigs[0]);
+        CHECK(harness.fake->liveConfigs[2] == old);
+    }
+}
+
+TEST_CASE("Stop cancels a pending preflight and does not launch a candidate") {
+    Harness harness;
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    harness.fake->preflightCode = -1;
+    const auto request = harness.session->SwitchProfile({"new", "{}"});
+    REQUIRE(request);
+    REQUIRE(WaitUntil([&] { return harness.fake->preflightStarts == 1; }));
+    harness.session->Stop();
+    REQUIRE(harness.WaitPhase(KernelPhase::Stopped));
+    const auto snapshot = harness.observer.Last();
+    REQUIRE(snapshot.profileSwitchResult);
+    CHECK(snapshot.profileSwitchResult->requestId == *request);
+    CHECK(snapshot.profileSwitchResult->outcome == ProfileSwitchOutcome::Cancelled);
+    CHECK(snapshot.runningProfileId.empty());
+    CHECK(harness.fake->processStarts == 1);
+    CHECK(harness.fake->preflightStops == 1);
+}
+
+TEST_CASE("shutdown discards a pending switch without publishing late results") {
+    Harness harness;
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    harness.fake->preflightCode = -1;
+    REQUIRE(harness.session->SwitchProfile({"new", "{}"}));
+    REQUIRE(WaitUntil([&] { return harness.fake->preflightStarts == 1; }));
+    harness.session->Shutdown();
+    CHECK(harness.session->Snapshot().phase == KernelPhase::Stopped);
+    CHECK_FALSE(harness.session->Snapshot().profileSwitchInProgress);
+    CHECK_FALSE(harness.observer.Last().profileSwitchResult);
+    CHECK(harness.fake->processStarts == 1);
+    CHECK(harness.fake->preflightStops == 1);
 }
 
 }  // namespace

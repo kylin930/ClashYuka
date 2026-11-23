@@ -6,6 +6,7 @@
 
 #include <wx/app.h>
 #include <wx/stdpaths.h>
+#include <wx/utils.h>
 
 #include "clashyuka/app/app_text.h"
 #include "clashyuka/app/archive_extractor.h"
@@ -26,8 +27,15 @@ std::string PathToUtf8(const fs::path& path) {
     return std::string(value.begin(), value.end());
 }
 
-std::string DefaultSettingsPath() {
-    const wxString directory = wxStandardPaths::Get().GetUserDataDir();
+constexpr char kInvalidDataDirectory[] = "CLASHYUKA_DATA_DIR must be an absolute directory path.";
+
+std::string GetSettingsPath() {
+    wxString directory;
+    if (wxGetEnv("CLASHYUKA_DATA_DIR", &directory)) {
+        const auto path = PathFromUtf8(directory.utf8_string());
+        return path.is_absolute() ? PathToUtf8(path / "settings.json") : std::string{};
+    }
+    directory = wxStandardPaths::Get().GetUserDataDir();
     return PathToUtf8(PathFromUtf8(directory.utf8_string()) / "settings.json");
 }
 
@@ -96,6 +104,7 @@ bool IsSessionActive(const runtime::KernelSession* session) {
 AppController::AppController(AppShell* shell) : shell_(shell) {
     SyncThemeState();
     settings_ = runtime::DefaultSettings();
+    Bind(wxEVT_TIMER, [this](wxTimerEvent&) { TickSubscriptions(); });
 }
 
 AppController::~AppController() {
@@ -166,7 +175,14 @@ void AppController::InitializeRuntime() {
         return;
     }
 
-    settingsPath_ = DefaultSettingsPath();
+    if (settingsPath_.empty()) {
+        settingsPath_ = GetSettingsPath();
+    }
+    if (settingsPath_.empty()) {
+        state_.SetKernelError(kInvalidDataDirectory);
+        ShowMessage(kInvalidDataDirectory);
+        return;
+    }
     const runtime::SettingsLoadResult loaded = runtime::LoadSettings(settingsPath_);
     settings_ = loaded.settings;
     settingsDirectory_ = PathToUtf8(PathFromUtf8(settingsPath_).parent_path());
@@ -175,12 +191,35 @@ void AppController::InitializeRuntime() {
     state_.SetApiAddress(FormatAddress(settings_.controllerHost, settings_.controllerPort));
     state_.SetKernelError("");
 
+    profileStoreError_.clear();
+    profileActionStatus_.clear();
+    auto opened = runtime::ProfileStore::Open(PathFromUtf8(settingsDirectory_));
+    if (opened) {
+        profileStore_ = opened.Take();
+        subscriptions_ = std::make_unique<runtime::SubscriptionService>(*profileStore_);
+    } else {
+        profileStoreError_ = "Could not open profiles: " + opened.error().message;
+    }
+
+    uiLifetime_ = std::make_shared<int>(0);
     kernel_ = std::make_unique<runtime::KernelSession>(
         runtime::CreateDefaultDriverFactory(), MakeUiDispatcher());
     kernel_->SetOptions(BuildKernelOptions());
     kernel_->SetObserver(this);
+    systemProxy_ = platform::CreateSystemProxyController();
+    state_.SetSystemProxy(settings_.enableSystemProxy, false, "");
     CreateInstaller();
     runtimeInitialized_ = true;
+    PublishProfiles();
+    if (subscriptions_ && subscriptions_->Available()) {
+        subscriptionTimer_ = std::make_unique<wxTimer>(static_cast<wxEvtHandler*>(this));
+        subscriptionTimer_->Start(250);
+    }
+    // Check a saved non-built-in selection even with auto-start disabled.
+    if (!settings_.autoStartKernel && profileStore_ &&
+        profileStore_->SelectedProfileId() != runtime::kBuiltInProfileId) {
+        PrepareSelectedKernel();
+    }
 
     if (!loaded.warning.empty()) {
         ShowMessage(wxString::FromUTF8("Mihomo settings: " + loaded.warning));
@@ -193,17 +232,37 @@ void AppController::InitializeRuntime() {
 }
 
 void AppController::ShutdownRuntime() {
+    runtimeInitialized_ = false;
+    subscriptionTimer_.reset();
+    if (subscriptions_) {
+        subscriptions_->Shutdown();
+        subscriptions_.reset();
+    }
+    profileStore_.reset();
+    addingSubscription_.reset();
+    pendingProfileSwitch_.reset();
+    profileRevisions_.clear();
+    runningProfileId_.clear();
+    launchProfileId_.clear();
+    if (systemProxy_ && systemProxy_->Active()) {
+        const auto disabled = systemProxy_->Disable();
+        if (!disabled) {
+            std::fprintf(stderr, "[clashyuka] system proxy shutdown: %s\n",
+                         disabled.error().message.c_str());
+        }
+        systemProxyPort_ = 0;
+    }
+    systemProxy_.reset();
     StopInstallerThread();
+    uiLifetime_.reset();
     installer_.reset();
     DestroyProxyService();
     if (!kernel_) {
-        runtimeInitialized_ = false;
         return;
     }
     kernel_->SetObserver(nullptr);
     kernel_->Shutdown();
     kernel_.reset();
-    runtimeInitialized_ = false;
     core::MarkStartup("kernel-session-shutdown");
 }
 
@@ -212,7 +271,12 @@ void AppController::StartKernel() {
         ShowMessage("Mihomo runtime is not initialized yet.");
         return;
     }
-    kernel_->Start();
+    const auto phase = kernel_->Phase();
+    if (!pendingProfileSwitch_ &&
+        (phase == runtime::KernelPhase::Stopped || phase == runtime::KernelPhase::Failed) &&
+        PrepareSelectedKernel()) {
+        kernel_->Start();
+    }
 }
 
 void AppController::StopKernel() {
@@ -226,7 +290,21 @@ void AppController::RestartKernel() {
         ShowMessage("Mihomo runtime is not initialized yet.");
         return;
     }
-    kernel_->Restart();
+    const auto current = kernel_->Snapshot();
+    if (pendingProfileSwitch_ || current.profileSwitchInProgress ||
+        current.phase == runtime::KernelPhase::Stopping) {
+        return;
+    }
+    if (current.phase == runtime::KernelPhase::Running && profileStore_) {
+        const auto selected = profileStore_->SelectedProfileId();
+        if (selected != current.runningProfileId || profileRevisions_[selected] != runningRevision_) {
+            ActivateProfile(selected);
+            return;
+        }
+    }
+    if (PrepareSelectedKernel()) {
+        kernel_->Restart();
+    }
 }
 
 runtime::KernelOptions AppController::BuildKernelOptions() const {
@@ -240,6 +318,282 @@ runtime::KernelOptions AppController::BuildKernelOptions() const {
     options.mixedPort = settings_.mixedPort;
     options.secret = settings_.secret;
     return options;
+}
+
+core::Result<runtime::KernelProfile> AppController::LoadProfile(const std::string& id) const {
+    if (id == runtime::kBuiltInProfileId) {
+        return runtime::KernelProfile{id, std::nullopt};
+    }
+    auto bytes = profileStore_->LoadProfileBytes(id);
+    if (!bytes) {
+        return bytes.error();
+    }
+    return runtime::KernelProfile{id, bytes.Take()};
+}
+
+bool AppController::PrepareSelectedKernel() {
+    if (!profileStore_) {
+        state_.SetKernelError(profileStoreError_);
+        ShowMessage(wxString::FromUTF8(profileStoreError_));
+        return false;
+    }
+    const auto id = profileStore_->SelectedProfileId();
+    auto profile = LoadProfile(id);
+    if (!profile) {
+        const auto message = "Could not load the next-start profile: " + profile.error().message +
+                             ". Select Built-in in Profiles to recover.";
+        state_.SetKernelError(message);
+        ProfileMessage(wxString::FromUTF8(message));
+        return false;
+    }
+    auto options = BuildKernelOptions();
+    options.profile = profile.Take();
+    launchProfileId_ = id;
+    launchRevision_ = profileRevisions_[id];
+    kernel_->SetOptions(std::move(options));
+    return true;
+}
+
+void AppController::PublishProfiles() {
+    if (!runtimeInitialized_) {
+        return;
+    }
+    ProfilesSnapshot view;
+    view.storeError = profileStoreError_;
+    view.actionStatus = profileActionStatus_;
+    view.runningProfileId = runningProfileId_;
+    view.switching = pendingProfileSwitch_.has_value();
+    view.addingSubscription = addingSubscription_.has_value();
+    view.subscriptionsAvailable = subscriptions_ && subscriptions_->Available();
+    if (profileStore_) {
+        view.selectedProfileId = profileStore_->SelectedProfileId();
+        for (const auto& profile : profileStore_->ListProfiles()) {
+            view.rows.push_back({profile.id, profile.name, profile.kind, profile.refresh.outcome,
+                                 profile.refresh.completedAt,
+                                 subscriptions_ && subscriptions_->Busy(profile.id)});
+        }
+        view.runningCopyOutdated = !runningProfileId_.empty() &&
+                                   profileRevisions_[runningProfileId_] != runningRevision_;
+    }
+    state_.SetProfiles(std::move(view));
+}
+
+void AppController::ProfileMessage(const wxString& message) {
+    if (!runtimeInitialized_) {
+        return;
+    }
+    profileActionStatus_ = message.utf8_string();
+    PublishProfiles();
+    ShowMessage(message);
+}
+
+void AppController::ImportProfile(const wxString& path) {
+    if (!profileStore_) {
+        return;
+    }
+    auto imported = profileStore_->ImportLocal(PathFromUtf8(path.utf8_string()));
+    ProfileMessage(imported ? wxString("Profile imported. YAML checked. Mihomo checks it at activation.")
+                            : wxString::FromUTF8(imported.error().message));
+}
+
+void AppController::RenameProfile(const std::string& id, const wxString& name) {
+    if (!profileStore_) {
+        return;
+    }
+    const auto renamed = profileStore_->RenameProfile(id, name.utf8_string());
+    ProfileMessage(renamed ? wxString("Profile renamed.")
+                           : wxString::FromUTF8(renamed.error().message));
+}
+
+bool AppController::CanDeleteProfile(const std::string& id) const {
+    return profileStore_ && kernel_ && !pendingProfileSwitch_ &&
+           id != runtime::kBuiltInProfileId && id != profileStore_->SelectedProfileId() &&
+           id != kernel_->Snapshot().runningProfileId &&
+           (!subscriptions_ || !subscriptions_->Busy(id));
+}
+
+void AppController::DeleteProfile(const std::string& id) {
+    if (!CanDeleteProfile(id)) {
+        ProfileMessage("A built-in, selected, running or busy profile cannot be deleted.");
+        return;
+    }
+    if (!shell_ || !shell_->ShowConfirmDialog("Delete profile", "Delete this saved profile?", "Delete") ||
+        !CanDeleteProfile(id)) {
+        return;
+    }
+    const auto removed = profileStore_->DeleteProfile(id, kernel_->Snapshot().runningProfileId);
+    if (removed) {
+        profileRevisions_.erase(id);
+    }
+    ProfileMessage(removed ? wxString("Profile deleted.")
+                           : wxString::FromUTF8(removed.error().message));
+}
+
+void AppController::PersistProfileSelection(const std::string& id) {
+    const auto saved = profileStore_->SelectProfile(id);
+    if (!saved) {
+        ProfileMessage(wxString::FromUTF8("Could not save the next-start profile: " +
+                                         saved.error().message + ". You can retry in Profiles."));
+        return;
+    }
+    state_.SetKernelError("");
+    ProfileMessage("Next-start profile saved.");
+}
+
+void AppController::ActivateProfile(const std::string& id) {
+    if (!profileStore_ || !kernel_ || pendingProfileSwitch_) {
+        return;
+    }
+    const auto current = kernel_->Snapshot();
+    if (current.phase == runtime::KernelPhase::Running && current.runningProfileId == id &&
+        profileStore_->SelectedProfileId() != id) {
+        PersistProfileSelection(id);
+        return;
+    }
+    if (current.phase == runtime::KernelPhase::Stopped || current.phase == runtime::KernelPhase::Failed) {
+        auto profile = LoadProfile(id);
+        if (!profile) {
+            ProfileMessage(wxString::FromUTF8("Could not select profile: " + profile.error().message));
+            return;
+        }
+        PersistProfileSelection(id);
+        return;
+    }
+    if (current.phase != runtime::KernelPhase::Running || current.profileSwitchInProgress ||
+        (current.runningProfileId == id && profileRevisions_[id] == runningRevision_)) {
+        return;
+    }
+    if (!shell_ || !shell_->ShowConfirmDialog("Apply profile",
+            "Mihomo will check the profile and restart the kernel if the check passes.", "Apply") ||
+        !profileStore_ || !kernel_ || pendingProfileSwitch_) {
+        return;
+    }
+    const auto confirmed = kernel_->Snapshot();
+    if (confirmed.phase != runtime::KernelPhase::Running || confirmed.generation != current.generation) {
+        ProfileMessage("The kernel changed during confirmation. Choose the profile again.");
+        return;
+    }
+    auto profile = LoadProfile(id);
+    if (!profile) {
+        ProfileMessage(wxString::FromUTF8("Could not apply profile: " + profile.error().message));
+        return;
+    }
+    switchRevision_ = profileRevisions_[id];
+    pendingProfileSwitch_ = kernel_->SwitchProfile(profile.Take());
+    ProfileMessage(pendingProfileSwitch_ ? "Checking and applying profile..."
+                                         : "The kernel is no longer ready to switch profiles.");
+}
+
+void AppController::ConsumeProfileSwitch(const runtime::KernelSnapshot& snapshot) {
+    if (!pendingProfileSwitch_ || !snapshot.profileSwitchResult ||
+        snapshot.profileSwitchResult->requestId != *pendingProfileSwitch_) {
+        return;
+    }
+    pendingProfileSwitch_.reset();
+    const auto& result = *snapshot.profileSwitchResult;
+    switch (result.outcome) {
+        case runtime::ProfileSwitchOutcome::Succeeded:
+            runningRevision_ = switchRevision_;
+            PersistProfileSelection(result.newProfileId);
+            break;
+        case runtime::ProfileSwitchOutcome::Rejected:
+            ProfileMessage(wxString::FromUTF8("Profile rejected: " + result.error.message));
+            break;
+        case runtime::ProfileSwitchOutcome::RolledBack:
+            ProfileMessage(wxString::FromUTF8("The previous profile was restored. Switch failed: " +
+                                              result.error.message));
+            break;
+        case runtime::ProfileSwitchOutcome::RollbackFailed:
+            ProfileMessage("The new profile failed and Mihomo could not restore the previous one.");
+            break;
+        case runtime::ProfileSwitchOutcome::Cancelled:
+            ProfileMessage("Profile switch cancelled.");
+            break;
+    }
+}
+
+std::optional<runtime::SubscriptionSettings> AppController::SubscriptionForEdit(const std::string& id) {
+    if (!subscriptions_ || !subscriptions_->Available() || subscriptions_->Busy(id)) {
+        return std::nullopt;
+    }
+    auto settings = profileStore_->GetSubscriptionSettings(id);
+    if (!settings) {
+        ProfileMessage(wxString::FromUTF8(settings.error().message));
+        return std::nullopt;
+    }
+    return settings.Take();
+}
+
+void AppController::AddSubscription(const wxString& name, const runtime::SubscriptionSettings& settings) {
+    if (!subscriptions_ || !subscriptions_->Available() || addingSubscription_) {
+        return;
+    }
+    auto added = subscriptions_->Add(name.utf8_string(), settings, settings_.downloadProxy);
+    if (added) {
+        addingSubscription_ = added.value();
+    }
+    ProfileMessage(added ? wxString("Downloading subscription...")
+                         : wxString::FromUTF8(added.error().message));
+}
+
+void AppController::EditSubscription(const std::string& id, const runtime::SubscriptionSettings& settings) {
+    if (!subscriptions_ || !subscriptions_->Available()) {
+        return;
+    }
+    const auto edited = subscriptions_->Edit(id, settings, settings_.downloadProxy);
+    if (!edited) {
+        ProfileMessage(wxString::FromUTF8(edited.error().message));
+        return;
+    }
+    ProfileMessage(edited.value() ? "Downloading updated subscription..." : "Subscription settings saved.");
+}
+
+void AppController::RefreshSubscription(const std::string& id) {
+    if (!subscriptions_ || !subscriptions_->Available()) {
+        return;
+    }
+    const auto refreshing = subscriptions_->Refresh(id, settings_.downloadProxy);
+    ProfileMessage(refreshing ? wxString("Refreshing subscription...")
+                              : wxString::FromUTF8(refreshing.error().message));
+}
+
+void AppController::CancelSubscription(const std::string& id) {
+    if (!subscriptions_) {
+        return;
+    }
+    const bool cancelled = id.empty() ? (addingSubscription_ && subscriptions_->Cancel(*addingSubscription_))
+                                      : subscriptions_->Cancel(id);
+    if (cancelled) {
+        ProfileMessage("Cancelling subscription download...");
+    }
+}
+
+void AppController::TickSubscriptions() {
+    if (!runtimeInitialized_ || !subscriptions_) {
+        return;
+    }
+    const auto results = subscriptions_->Tick(settings_.downloadProxy);
+    for (const auto& result : results) {
+        if (addingSubscription_ == result.job) {
+            addingSubscription_.reset();
+        }
+        if (result.outcome == runtime::ProfileRefreshOutcome::Succeeded) {
+            ++profileRevisions_[result.profileId];
+        }
+    }
+    PublishProfiles();
+    for (const auto& result : results) {
+        if (result.automatic) {
+            continue;
+        }
+        if (result.error) {
+            ProfileMessage(wxString::FromUTF8(result.error.message));
+        } else if (result.operation == runtime::SubscriptionService::Operation::Add) {
+            ProfileMessage("Subscription added. YAML checked. Mihomo checks it at activation.");
+        } else {
+            ProfileMessage("Subscription copy saved. Apply it in Profiles to update a running kernel.");
+        }
+    }
 }
 
 bool AppController::SaveKernelSettings(const runtime::AppSettings& settings, wxString* error,
@@ -270,7 +624,13 @@ bool AppController::SaveKernelSettings(const runtime::AppSettings& settings, wxS
     }
 
     if (settingsPath_.empty()) {
-        settingsPath_ = DefaultSettingsPath();
+        settingsPath_ = GetSettingsPath();
+    }
+    if (settingsPath_.empty()) {
+        if (error != nullptr) {
+            *error = kInvalidDataDirectory;
+        }
+        return false;
     }
     const core::Result<void> saved = runtime::SaveSettings(settingsPath_, settings);
     if (!saved) {
@@ -293,7 +653,9 @@ bool AppController::SaveKernelSettings(const runtime::AppSettings& settings, wxS
     state_.SetApiAddress(FormatAddress(settings_.controllerHost, settings_.controllerPort));
     state_.SetKernelError("");
     if (kernel_) {
-        kernel_->SetOptions(BuildKernelOptions());
+        auto options = BuildKernelOptions();
+        options.profile = kernel_->Options().profile;
+        kernel_->SetOptions(std::move(options));
     }
     if (proxyService_) {
         proxyService_->SetTestSettings(settings_.proxyTestUrl, settings_.proxyTestTimeoutMs);
@@ -301,10 +663,28 @@ bool AppController::SaveKernelSettings(const runtime::AppSettings& settings, wxS
     if (!installerBusy_) {
         CreateInstaller();
     }
+    SyncSystemProxy();
     return true;
 }
 
 void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
+    if (!runtimeInitialized_) {
+        return;
+    }
+    const bool ready = snapshot.phase == runtime::KernelPhase::Running;
+    runningProfileId_ = ready ? snapshot.runningProfileId : std::string{};
+    if (ready && !launchProfileId_.empty() && launchProfileId_ == runningProfileId_) {
+        runningRevision_ = launchRevision_;
+        launchProfileId_.clear();
+    } else if (snapshot.phase == runtime::KernelPhase::Failed) {
+        launchProfileId_.clear();
+    }
+    if (proxyService_ && (!ready || proxyServiceGeneration_ != snapshot.generation)) {
+        DestroyProxyService();
+        state_.SetProxyCatalog(nullptr);
+        state_.SetTraffic(0.0, 0.0, false);
+        state_.SetConnectionCount(0);
+    }
     if (!snapshot.apiAddress.empty()) {
         state_.SetApiAddress(snapshot.apiAddress);
     }
@@ -314,22 +694,18 @@ void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
 
     state_.SetKernelState(MapKernelPhase(snapshot.phase));
     state_.SetApiState(MapApiPhase(snapshot.phase));
-    if (!snapshot.version.empty()) {
-        state_.SetMihomoVersion(snapshot.version);
-    }
+    state_.SetMihomoVersion(snapshot.version);
+    SyncSystemProxy();
 
     switch (snapshot.phase) {
         case runtime::KernelPhase::Running:
-            state_.SetProfile("Built-in Runtime Config", true);
             state_.SetKernelError("");
             CreateProxyService();
+            if (proxyService_) {
+                proxyServiceGeneration_ = snapshot.generation;
+            }
             break;
         case runtime::KernelPhase::Failed: {
-            DestroyProxyService();
-            state_.SetProxyCatalog(nullptr);
-            state_.SetProfile("", false);
-            state_.SetTraffic(0.0, 0.0, false);
-            state_.SetConnectionCount(0);
             const wxString friendly = KernelErrorText(snapshot.error.kind);
             state_.SetKernelError(friendly.utf8_string());
             if (snapshot.generation != lastShownFailure_) {
@@ -343,21 +719,23 @@ void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
             break;
         }
         case runtime::KernelPhase::Stopped:
-            DestroyProxyService();
-            state_.SetProxyCatalog(nullptr);
-            state_.SetProfile("", false);
-            state_.SetTraffic(0.0, 0.0, false);
-            state_.SetConnectionCount(0);
-            state_.SetKernelError("");
-            break;
         case runtime::KernelPhase::Starting:
         case runtime::KernelPhase::WaitingForApi:
-            state_.SetProfile("", false);
             state_.SetKernelError("");
             break;
         case runtime::KernelPhase::Stopping:
             break;
     }
+    if (!ready) {
+        state_.SetTraffic(0.0, 0.0, false);
+        state_.SetConnectionCount(0);
+    }
+    if (snapshot.profileSwitchResult && pendingProfileSwitch_ == snapshot.profileSwitchResult->requestId &&
+        snapshot.profileSwitchResult->outcome == runtime::ProfileSwitchOutcome::RollbackFailed) {
+        state_.SetKernelError("Profile switch failed and Mihomo could not restore the previous kernel.");
+    }
+    ConsumeProfileSwitch(snapshot);
+    PublishProfiles();
 
     if (!snapshot.eventError.empty() &&
         snapshot.generation != lastShownEventWarning_) {
@@ -443,6 +821,78 @@ void AppController::CancelProxyTests() {
     }
 }
 
+void AppController::SyncSystemProxy() {
+    if (!systemProxy_) {
+        return;
+    }
+    const auto session = kernel_ ? kernel_->Snapshot() : runtime::KernelSnapshot{};
+    const bool running = session.phase == runtime::KernelPhase::Running;
+    const int port = session.mixedPort;
+    const bool shouldApply = settings_.enableSystemProxy && running && port > 0 && port <= 65535;
+    if (!shouldApply) {
+        if (systemProxy_->Active()) {
+            const core::Result<void> disabled = systemProxy_->Disable();
+            if (!disabled) {
+                ShowMessage(wxString::FromUTF8("System proxy: " + disabled.error().message));
+            }
+        }
+        if (!systemProxy_->Active()) {
+            systemProxyPort_ = 0;
+        }
+        state_.SetSystemProxy(settings_.enableSystemProxy, systemProxy_->Active(),
+                              systemProxy_->ActiveServer());
+        if (settings_.enableSystemProxy && running) {
+            ShowMessage("System proxy requires an enabled Mihomo mixed port.");
+        }
+        return;
+    }
+
+    if (systemProxy_->Active() && systemProxyPort_ == port) {
+        state_.SetSystemProxy(true, true, systemProxy_->ActiveServer());
+        return;
+    }
+    if (systemProxy_->Active()) {
+        const auto disabled = systemProxy_->Disable();
+        if (!disabled) {
+            ShowMessage(wxString::FromUTF8("System proxy: " + disabled.error().message));
+            return;
+        }
+        systemProxyPort_ = 0;
+    }
+    const core::Result<void> enabled = systemProxy_->Enable(
+        "127.0.0.1", port, platform::DefaultSystemProxyBypass());
+    if (!enabled) {
+        state_.SetSystemProxy(settings_.enableSystemProxy, systemProxy_->Active(),
+                              systemProxy_->ActiveServer());
+        ShowMessage(wxString::FromUTF8("System proxy: " + enabled.error().message));
+        return;
+    }
+    systemProxyPort_ = port;
+    state_.SetSystemProxy(true, true, systemProxy_->ActiveServer());
+}
+
+void AppController::SetSystemProxyEnabled(bool enabled) {
+    if (settings_.enableSystemProxy == enabled) {
+        SyncSystemProxy();
+        return;
+    }
+    runtime::AppSettings next = settings_;
+    next.enableSystemProxy = enabled;
+    wxString error;
+    if (!SaveKernelSettings(next, &error, nullptr)) {
+        ShowMessage("Could not save the system proxy preference: " + error);
+        return;
+    }
+    const bool active = state_.Get().systemProxyActive;
+    if (enabled && active) {
+        ShowMessage("System proxy enabled.");
+    } else if (enabled && (!kernel_ || kernel_->Phase() != runtime::KernelPhase::Running)) {
+        ShowMessage("System proxy will apply when the kernel runs.");
+    } else if (!enabled && !active) {
+        ShowMessage("System proxy disabled.");
+    }
+}
+
 void AppController::OnProxyCatalog(const std::shared_ptr<const runtime::ProxyCatalog>& catalog) {
     state_.SetProxyCatalog(catalog);
     if (catalog && !catalog->error.empty() &&
@@ -471,7 +921,12 @@ void AppController::PostToUi(std::function<void()> task) {
     if (!task) {
         return;
     }
-    MakeUiDispatcher()(std::move(task));
+    const std::weak_ptr<int> lifetime = uiLifetime_;
+    MakeUiDispatcher()([lifetime, task = std::move(task)] {
+        if (!lifetime.expired()) {
+            task();
+        }
+    });
 }
 
 void AppController::PublishKernelUpdate(

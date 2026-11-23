@@ -1,15 +1,18 @@
 #include "clashyuka/platform/http_download.h"
 
+#define NOMINMAX
 #include <algorithm>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
-#include <windows.h>
-#include <winhttp.h>
+#include "http_download_windows.h"
 
 #include "clashyuka/core/result.h"
 
@@ -62,7 +65,7 @@ struct UrlParts {
     bool secure = false;
 };
 
-bool CrackUrl(const std::string& url, UrlParts& parts) {
+bool CrackUrl(const std::string& url, UrlParts& parts, bool allowEmptyTarget = false) {
     const std::wstring wide = ToWide(url);
     if (wide.empty()) {
         return false;
@@ -91,7 +94,7 @@ bool CrackUrl(const std::string& url, UrlParts& parts) {
     parts.target.append(extra, components.dwExtraInfoLength);
     parts.port = components.nPort;
     parts.secure = components.nScheme == INTERNET_SCHEME_HTTPS;
-    return !parts.host.empty() && !parts.target.empty();
+    return !parts.host.empty() && (allowEmptyTarget || !parts.target.empty());
 }
 
 std::string ResolveRedirect(const UrlParts& base, const std::wstring& location) {
@@ -125,22 +128,22 @@ struct WinHttpHandles {
     }
 };
 
-HINTERNET OpenSession(const std::string& proxyUrl) {
+HINTERNET OpenSession(const std::string& proxyUrl, DWORD flags = 0) {
     if (!proxyUrl.empty()) {
         UrlParts proxy;
-        if (!CrackUrl(proxyUrl, proxy)) {
+        if (!CrackUrl(proxyUrl, proxy, (flags & WINHTTP_FLAG_ASYNC) != 0)) {
             return nullptr;
         }
         const std::wstring proxySpec =
             proxy.host + L":" + std::to_wstring(proxy.port);
         return ::WinHttpOpen(kUserAgent, WINHTTP_ACCESS_TYPE_NAMED_PROXY,
-                             proxySpec.c_str(), WINHTTP_NO_PROXY_BYPASS, 0);
+                             proxySpec.c_str(), WINHTTP_NO_PROXY_BYPASS, flags);
     }
     HINTERNET session = ::WinHttpOpen(kUserAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, flags);
     if (session == nullptr) {
         session = ::WinHttpOpen(kUserAgent, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, flags);
     }
     return session;
 }
@@ -284,7 +287,226 @@ core::Result<DWORD> RequestOnce(const std::string& url, const HttpHeaders& heade
     return status;
 }
 
+// Each async WinHTTP operation is awaited on the calling worker. Closing the
+// request interrupts I/O; HANDLE_CLOSING is the lifetime fence for the callback
+// context and read buffer, including after timeout or cancellation.
+class BoundedRequest {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    explicit BoundedRequest(WinHttpHandles& handles) : handles_(handles) {}
+    ~BoundedRequest() {
+        if (registered_) {
+            ::WinHttpCloseHandle(std::exchange(handles_.request, nullptr));
+            std::unique_lock lock(mutex_);
+            changed_.wait(lock, [this] { return closed_; });
+        }
+    }
+
+    bool Register() {
+        DWORD_PTR context = reinterpret_cast<DWORD_PTR>(this);
+        if (!::WinHttpSetOption(handles_.request, WINHTTP_OPTION_CONTEXT_VALUE,
+                                &context, sizeof(context))) {
+            return false;
+        }
+        registered_ = ::WinHttpSetStatusCallback(
+            handles_.request, OnStatus,
+            WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS | WINHTTP_CALLBACK_FLAG_HANDLES,
+            0) != WINHTTP_INVALID_STATUS_CALLBACK;
+        return registered_;
+    }
+
+    template <typename Start>
+    core::Result<DWORD> Run(Start start, Clock::time_point deadline, std::atomic<bool>& cancel) {
+        if (auto stopped = StopReason(deadline, cancel); stopped) {
+            return stopped;
+        }
+        {
+            std::lock_guard lock(mutex_);
+            ready_ = false;
+        }
+        if (!start() && ::GetLastError() != ERROR_IO_PENDING) {
+            return IoError(::GetLastError());
+        }
+        std::unique_lock lock(mutex_);
+        while (!ready_) {
+            if (auto stopped = StopReason(deadline, cancel); stopped) {
+                return stopped;
+            }
+            changed_.wait_until(lock, std::min(deadline, Clock::now() +
+                                              std::chrono::milliseconds(20)));
+        }
+        if (auto stopped = StopReason(deadline, cancel); stopped) {
+            return stopped;
+        }
+        return error_ == ERROR_SUCCESS ? core::Result<DWORD>(bytes_) : IoError(error_);
+    }
+
+    DWORD_PTR Context() { return reinterpret_cast<DWORD_PTR>(this); }
+    char* Buffer() { return buffer_; }
+    DWORD Capacity() const { return sizeof(buffer_); }
+
+private:
+    static core::Error StopReason(Clock::time_point deadline, std::atomic<bool>& cancel) {
+        if (cancel.load()) {
+            return MakeError(ErrorKind::Cancelled, "download cancelled");
+        }
+        if (Clock::now() >= deadline) {
+            return MakeError(ErrorKind::Timeout, "HTTPS download timed out");
+        }
+        return {};
+    }
+
+    static core::Error IoError(DWORD error) {
+        if (error == ERROR_WINHTTP_TIMEOUT) {
+            return MakeError(ErrorKind::Timeout, "HTTPS download timed out");
+        }
+        if (error == ERROR_WINHTTP_SECURE_FAILURE || error == ERROR_WINHTTP_SECURE_INVALID_CA) {
+            return MakeError(ErrorKind::DownloadFailed, "HTTPS server certificate validation failed");
+        }
+        return MakeError(ErrorKind::DownloadFailed, "the HTTPS download request failed");
+    }
+
+    static void CALLBACK OnStatus(HINTERNET, DWORD_PTR context, DWORD status,
+                                  LPVOID info, DWORD length) {
+        if (context == 0) {
+            return;
+        }
+        auto& self = *reinterpret_cast<BoundedRequest*>(context);
+        std::lock_guard lock(self.mutex_);
+        switch (status) {
+            case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
+                self.closed_ = true;
+                break;
+            case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
+                self.error_ = static_cast<const WINHTTP_ASYNC_RESULT*>(info)->dwError;
+                self.ready_ = true;
+                break;
+            case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
+            case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE:
+            case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
+                self.error_ = ERROR_SUCCESS;
+                self.bytes_ = status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE ? length : 0;
+                self.ready_ = true;
+                break;
+            default:
+                return;
+        }
+        self.changed_.notify_one();
+    }
+
+    WinHttpHandles& handles_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool registered_ = false;
+    bool closed_ = false;
+    bool ready_ = false;
+    DWORD error_ = ERROR_SUCCESS;
+    DWORD bytes_ = 0;
+    char buffer_[16 * 1024];
+};
+
 }  // namespace
+
+bool detail::ConfigureBoundedHttpsRequest(HINTERNET request) {
+    DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    DWORD redirects = kMaxRedirects;
+    DWORD disable = WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION;
+    return ::WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy)) &&
+           ::WinHttpSetOption(request, WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS,
+                              &redirects, sizeof(redirects)) &&
+           ::WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &disable, sizeof(disable));
+}
+
+bool HttpsTextAvailable() noexcept { return true; }
+
+core::Result<HttpTextResponse> HttpGetBoundedHttpsText(
+    const std::string& url, const std::string& proxyUrl, const HttpsTextLimits& limits,
+    std::atomic<bool>& cancel) {
+    if (cancel.load()) {
+        return MakeError(ErrorKind::Cancelled, "download cancelled");
+    }
+    if (limits.timeout <= std::chrono::milliseconds::zero()) {
+        return MakeError(ErrorKind::Timeout, "HTTPS download timed out");
+    }
+    const auto deadline = BoundedRequest::Clock::now() +
+                          std::min(limits.timeout, std::chrono::milliseconds(300000));
+    UrlParts parts;
+    const auto scheme = url.find("://");
+    const auto authority = scheme == url.npos ? std::string_view{} :
+                           std::string_view(url).substr(scheme + 3);
+    const auto suffix = authority.find_first_of("/?#");
+    if (url.size() > 8192 || authority.substr(0, suffix).find('@') != url.npos ||
+        std::ranges::any_of(url, [](unsigned char ch) { return ch <= 32 || ch == 127 || ch == '\\'; }) ||
+        !CrackUrl(url.substr(0, url.find('#')), parts, true) || !parts.secure) {
+        return MakeError(ErrorKind::InvalidConfig, "a valid HTTPS download URL is required");
+    }
+    if (parts.target.empty() || parts.target.front() == L'?') {
+        parts.target.insert(0, 1, L'/');
+    }
+
+    WinHttpHandles handles;
+    handles.session = OpenSession(proxyUrl, WINHTTP_FLAG_ASYNC);
+    if (handles.session) {
+        handles.connect = ::WinHttpConnect(handles.session, parts.host.c_str(), parts.port, 0);
+    }
+    if (handles.connect) {
+        handles.request = ::WinHttpOpenRequest(
+            handles.connect, L"GET", parts.target.c_str(), nullptr, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    }
+    if (!handles.request) {
+        return MakeError(ErrorKind::DownloadFailed, "could not open an HTTPS request");
+    }
+    if (!detail::ConfigureBoundedHttpsRequest(handles.request)) {
+        return MakeError(ErrorKind::DownloadFailed, "could not configure the HTTPS request");
+    }
+    BoundedRequest pending(handles);
+    if (!pending.Register()) {
+        return MakeError(ErrorKind::DownloadFailed, "could not configure HTTPS cancellation");
+    }
+    auto result = pending.Run([&] {
+        return ::WinHttpSendRequest(handles.request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                    WINHTTP_NO_REQUEST_DATA, 0, 0, pending.Context());
+    }, deadline, cancel);
+    if (!result) {
+        return result.error();
+    }
+    result = pending.Run([&] { return ::WinHttpReceiveResponse(handles.request, nullptr); },
+                         deadline, cancel);
+    if (!result) {
+        return result.error();
+    }
+
+    DWORD status = 0;
+    if (!QueryStatus(handles.request, status)) {
+        return MakeError(ErrorKind::DownloadFailed, "could not read the HTTPS status");
+    }
+    HttpTextResponse response{static_cast<int>(status), {}};
+    if (status < 200 || status >= 300) {
+        return response;
+    }
+    const auto tooLarge = MakeError(ErrorKind::InvalidConfig, "HTTPS response exceeds the size limit");
+    if (QueryContentLength(handles.request) > limits.maxBytes) {
+        return tooLarge;
+    }
+    for (;;) {
+        result = pending.Run([&] {
+            return ::WinHttpReadData(handles.request, pending.Buffer(), pending.Capacity(), nullptr);
+        }, deadline, cancel);
+        if (!result) {
+            return result.error();
+        }
+        const auto bytes = result.value();
+        if (bytes == 0) {
+            return response;
+        }
+        if (bytes > limits.maxBytes - response.body.size()) {
+            return tooLarge;
+        }
+        response.body.append(pending.Buffer(), bytes);
+    }
+}
 
 core::Result<HttpTextResponse> HttpGetText(const std::string& url, const HttpHeaders& headers,
                                            const std::string& proxyUrl,

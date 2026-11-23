@@ -21,6 +21,7 @@ private:
     TextBlock* apiValue_ = nullptr;
     TextBlock* versionValue_ = nullptr;
     TextBlock* profileValue_ = nullptr;
+    TextBlock* nextProfileValue_ = nullptr;
     TextBlock* modeValue_ = nullptr;
     TextBlock* uploadValue_ = nullptr;
     TextBlock* downloadValue_ = nullptr;

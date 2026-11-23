@@ -37,6 +37,8 @@ private:
     SearchField* apiPortField_ = nullptr;
     SearchField* secretField_ = nullptr;
     Switch* autoStart_ = nullptr;
+    Switch* systemProxy_ = nullptr;
+    TextBlock* systemProxyStatus_ = nullptr;
     SearchField* testUrlField_ = nullptr;
     SearchField* testTimeoutField_ = nullptr;
     SearchField* installDirField_ = nullptr;
