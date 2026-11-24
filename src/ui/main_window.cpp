@@ -10,6 +10,14 @@
 #include <wx/sizer.h>
 #include <wx/weakref.h>
 
+#ifdef __WXMSW__
+#include <wx/artprov.h>
+#include <wx/log.h>
+#include <wx/menu.h>
+#include <wx/msw/wrapwin.h>
+#include <wx/taskbar.h>
+#endif
+
 #include "clashyuka/app/app_text.h"
 #include "clashyuka/app/page_registry.h"
 #include "clashyuka/core/timing.h"
@@ -25,6 +33,60 @@
 #include "clashyuka/ui/theme/spacing_tokens.h"
 
 namespace clashyuka::ui {
+
+#ifdef __WXMSW__
+namespace {
+constexpr int kHotkeyFirst = 1;
+constexpr int kHotkeySecond = 2;
+constexpr int kTrayProxy = wxID_HIGHEST + 1;
+
+UINT TaskbarCreatedMessage() {
+    static const UINT message = ::RegisterWindowMessageW(L"TaskbarCreated");
+    return message;
+}
+}  // namespace
+
+class DesktopTrayIcon final : public wxTaskBarIcon {
+public:
+    explicit DesktopTrayIcon(MainWindow& window) : window_(window) {
+        Bind(wxEVT_TASKBAR_LEFT_DCLICK, [this](wxTaskBarIconEvent&) { window_.RestoreWindow(); });
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { window_.RestoreWindow(); }, wxID_OPEN);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+            auto& controller = window_.controller_;
+            if (controller.SystemProxyPreferenceAvailable()) {
+                controller.SetSystemProxyEnabled(!controller.Snapshot().systemProxyEnabled);
+            }
+        }, kTrayProxy);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+            // Let the native menu finish with its temporary event handler first.
+            wxWeakRef<MainWindow> window(&window_);
+            window_.CallAfter([window] {
+                if (window && !window->closing_) {
+                    window->Close(true);
+                }
+            });
+        }, wxID_EXIT);
+    }
+
+protected:
+    wxMenu* CreatePopupMenu() override {
+        using app::DesktopText;
+        auto* menu = new wxMenu;
+        menu->Append(wxID_OPEN, DesktopText("Open ClashYuka", "打开 ClashYuka"));
+        const auto& controller = window_.controller_;
+        auto* proxy = menu->AppendCheckItem(kTrayProxy,
+                                            DesktopText("System proxy preference", "系统代理开关"));
+        proxy->Check(controller.Snapshot().systemProxyEnabled);
+        proxy->Enable(controller.SystemProxyPreferenceAvailable());
+        menu->AppendSeparator();
+        menu->Append(wxID_EXIT, DesktopText("Exit ClashYuka", "退出 ClashYuka"));
+        return menu;
+    }
+
+private:
+    MainWindow& window_;
+};
+#endif
 
 // Bottom status strip: kernel/API state on the left, version and proxy mode on
 // the right. All values come from AppState; nothing is simulated.
@@ -135,19 +197,28 @@ MainWindow::MainWindow()
     // close-before-idle sequence from calling into a destroyed window.
     wxWeakRef<MainWindow> self(this);
     CallAfter([self] {
-        if (!self) {
+        if (!self || self->closing_) {
             return;
         }
         core::MarkStartup("main-window-shown");
+#ifdef __WXMSW__
+        self->EnsureTrayIcon();
+#endif
         self->controller_.InitializeRuntime();
     });
 }
 
 MainWindow::~MainWindow() {
+    closing_ = true;
+#ifdef __WXMSW__
+    StopDesktopControls();
+#endif
     controller_.ShutdownRuntime();
     AnimationManager::Instance().StopAll();
     controller_.State().RemoveObserver(this);
     ThemeManager::Instance().RemoveObserver(this);
+    // Pages unregister their observers while the controller still exists.
+    DestroyChildren();
 }
 
 void MainWindow::BuildUi() {
@@ -301,11 +372,123 @@ void MainWindow::OnSize(wxSizeEvent& event) {
 }
 
 void MainWindow::OnClose(wxCloseEvent& event) {
-    // Stop the worker, cancel readiness, close WebSockets and stop the kernel
-    // before the window (and its observers) go away.
+#ifdef __WXMSW__
+    if (!closing_ && event.CanVeto() && controller_.Settings().closeToTray && EnsureTrayIcon()) {
+        event.Veto();
+        Hide();
+        return;
+    }
+#endif
+    closing_ = true;
+#ifdef __WXMSW__
+    StopDesktopControls();
+#endif
     controller_.ShutdownRuntime();
     event.Skip();
 }
+
+#ifdef __WXMSW__
+bool MainWindow::EnsureTrayIcon() {
+    if (closing_ || !wxTaskBarIcon::IsAvailable()) {
+        return false;
+    }
+    if (!tray_) {
+        tray_ = std::make_unique<DesktopTrayIcon>(*this);
+    }
+    const auto icon = wxArtProvider::GetBitmapBundle(wxART_EXECUTABLE_FILE, wxART_OTHER, wxSize(16, 16));
+    if (!icon.IsOk()) {
+        return false;
+    }
+    // SetIcon verifies the shell still has the icon. IsIconInstalled only
+    // reflects wxWidgets' cached state and can be stale after Explorer restarts.
+    const wxLogNull silence;
+    if (tray_->SetIcon(icon, "ClashYuka")) {
+        return true;
+    }
+    if (tray_->IsIconInstalled()) {
+        tray_->RemoveIcon();
+        return tray_->SetIcon(icon, "ClashYuka");
+    }
+    return false;
+}
+
+void MainWindow::RestoreWindow() {
+    if (!closing_) {
+        Show();
+        Iconize(false);
+        Raise();
+    }
+}
+
+void MainWindow::ToggleWindow() {
+    if (closing_ || !IsEnabled()) {
+        return;
+    }
+    if (!IsShown() || IsIconized() || !IsActive()) {
+        RestoreWindow();
+    } else if (EnsureTrayIcon()) {
+        Hide();
+    } else {
+        // Keep a taskbar entry when no tray icon can restore the window.
+        Iconize();
+    }
+}
+
+bool MainWindow::PrepareWindowHotkey(const runtime::WindowHotkey& hotkey) {
+    if (closing_) {
+        return false;
+    }
+    if (!hotkey.key) {
+        return true;
+    }
+    const int id = activeHotkeyId_ == kHotkeyFirst ? kHotkeySecond : kHotkeyFirst;
+    UINT modifiers = MOD_NOREPEAT;
+    if (hotkey.ctrl) modifiers |= MOD_CONTROL;
+    if (hotkey.alt) modifiers |= MOD_ALT;
+    if (hotkey.shift) modifiers |= MOD_SHIFT;
+    if (hotkey.win) modifiers |= MOD_WIN;
+    if (!::RegisterHotKey(static_cast<HWND>(GetHandle()), id, modifiers, static_cast<UINT>(hotkey.key))) {
+        return false;
+    }
+    pendingHotkeyId_ = id;
+    return true;
+}
+
+void MainWindow::FinishWindowHotkey(bool commit) {
+    const int releaseId = commit ? activeHotkeyId_ : pendingHotkeyId_;
+    if (releaseId) {
+        ::UnregisterHotKey(static_cast<HWND>(GetHandle()), releaseId);
+    }
+    if (commit) {
+        activeHotkeyId_ = pendingHotkeyId_;
+    }
+    pendingHotkeyId_ = 0;
+}
+
+void MainWindow::StopDesktopControls() {
+    FinishWindowHotkey(false);
+    FinishWindowHotkey(true);
+    const wxLogNull silence;
+    tray_.reset();
+}
+
+WXLRESULT MainWindow::MSWWindowProc(WXUINT message, WXWPARAM wParam, WXLPARAM lParam) {
+    if (message == WM_HOTKEY && activeHotkeyId_ != 0 &&
+        wParam == static_cast<WXWPARAM>(activeHotkeyId_)) {
+        ToggleWindow();
+        return 0;
+    }
+    if (!closing_ && message != 0 && message == TaskbarCreatedMessage()) {
+        // Give wxTaskBarIcon a chance to handle the same broadcast first.
+        CallAfter([this] {
+            if (!closing_ && !EnsureTrayIcon() && !IsShown()) {
+                RestoreWindow();
+            }
+        });
+    }
+    return wxFrame::MSWWindowProc(message, wParam, lParam);
+}
+#endif
 
 void MainWindow::OnThemeChanged() {
     const ColorScheme& colors = ThemeManager::Instance().Colors();

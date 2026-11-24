@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -9,7 +10,9 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 #include "clashyuka/core/result.h"
 #include "clashyuka/mihomo/api_client.h"
@@ -47,6 +50,33 @@ struct ProfileSwitchResult {
     core::Error error;
 };
 
+enum class StreamAvailability { Waiting, Available, Disconnected, Disabled };
+
+struct StreamStatus {
+    StreamAvailability availability = StreamAvailability::Waiting;
+    std::string error;
+};
+
+struct ConnectionCloseResult {
+    std::uint64_t requestId = 0;
+    std::uint64_t generation = 0;
+    std::string connectionId;
+    core::Error error;
+};
+
+enum class RulesLoadStatus { Idle, Ready, Failed };
+enum class RuleProviderUpdateStatus { Idle, Updating, Updated, UpdateFailed, ReadbackFailed };
+
+struct RulesSnapshot {
+    std::shared_ptr<const mihomo::RuleCollection> rules;
+    std::shared_ptr<const mihomo::RuleProviderCollection> providers;
+    RulesLoadStatus rulesStatus = RulesLoadStatus::Idle;
+    RulesLoadStatus providersStatus = RulesLoadStatus::Idle;
+    RuleProviderUpdateStatus updateStatus = RuleProviderUpdateStatus::Idle;
+    bool loading = false;
+    bool operator==(const RulesSnapshot&) const = default;
+};
+
 struct KernelOptions {
     std::string executablePath;
     std::string workingDirectory;
@@ -66,6 +96,9 @@ struct KernelOptions {
     bool connectConnections = true;
     KernelProfile profile;
     int preflightTimeoutMs = 5000;
+    bool connectLogs = true;
+    // Known subscription URLs (controller secret is included automatically).
+    std::vector<std::string> logRedactions;
 };
 
 struct KernelSnapshot {
@@ -77,12 +110,17 @@ struct KernelSnapshot {
     bool generatedConfig = false;
     int mixedPort = 0;
     core::Error error;
-    // Recoverable event-stream failure. The kernel keeps running.
+    // Legacy aggregate for recoverable stream errors. Prefer the per-stream statuses.
     std::string eventError;
     std::string runningProfileId;
     bool profileSwitchInProgress = false;
     // Last terminal switch result. Deduplicate by requestId; Running alone is not success.
     std::optional<ProfileSwitchResult> profileSwitchResult;
+    StreamStatus trafficStream;
+    StreamStatus connectionStream;
+    StreamStatus logStream;
+    RulesSnapshot rules;
+    bool rulesAvailable = false;
 };
 
 class KernelSessionObserver {
@@ -91,6 +129,12 @@ public:
     virtual void OnKernelSnapshot(const KernelSnapshot& snapshot) = 0;
     virtual void OnKernelTraffic(double, double) {}
     virtual void OnKernelConnections(int) {}
+    // Full replacement snapshot. A valid empty snapshot is delivered too.
+    virtual void OnKernelConnections(std::uint64_t, const mihomo::ConnectionsSnapshot& snapshot) {
+        OnKernelConnections(static_cast<int>(std::min<std::size_t>(snapshot.connections.size(), 1000000)));
+    }
+    virtual void OnKernelLogs(std::uint64_t, const std::vector<mihomo::MihomoLogEntry>&) {}
+    virtual void OnKernelConnectionClose(const ConnectionCloseResult&) {}
 };
 
 // Driver interfaces keep KernelSession testable without a real kernel, network
@@ -109,6 +153,10 @@ class KernelApiDriver {
 public:
     virtual ~KernelApiDriver() = default;
     virtual core::Result<mihomo::MihomoVersion> GetVersion() = 0;
+    virtual core::Result<void> CloseConnection(std::string_view id) = 0;
+    virtual core::Result<mihomo::RuleCollection> GetRules() = 0;
+    virtual core::Result<mihomo::RuleProviderCollection> GetRuleProviders() = 0;
+    virtual core::Result<void> UpdateRuleProvider(std::string_view name) = 0;
 };
 
 class KernelEventDriver {
@@ -116,11 +164,13 @@ public:
     using TrafficHandler = std::function<void(const mihomo::TrafficStatistics&)>;
     using ConnectionHandler = std::function<void(const mihomo::ConnectionsSnapshot&)>;
     using ErrorHandler = std::function<void(const core::Error&)>;
+    using LogHandler = std::function<void(const mihomo::MihomoLogEntry&)>;
 
     virtual ~KernelEventDriver() = default;
     virtual core::Result<void> ConnectTraffic(TrafficHandler handler, ErrorHandler onError) = 0;
     virtual core::Result<void> ConnectConnections(ConnectionHandler handler, int intervalMs,
                                                   ErrorHandler onError) = 0;
+    virtual core::Result<void> ConnectLogs(LogHandler handler, ErrorHandler onError) = 0;
     virtual void Disconnect() = 0;
 };
 
@@ -151,7 +201,8 @@ public:
 
     void SetObserver(KernelSessionObserver* observer);
 
-    // New options apply to the next Start/Restart. Callable from any thread.
+    // New options apply to the next Start/Restart, except logRedactions,
+    // which also applies to incoming frames in the active stream. Callable from any thread.
     void SetOptions(KernelOptions options);
     KernelOptions Options() const;
 
@@ -161,6 +212,11 @@ public:
     // Running-only. A rejected submission returns nullopt and has no terminal result.
     // Stop cancels an accepted switch; Restart is ignored while one is pending.
     std::optional<std::uint64_t> SwitchProfile(KernelProfile profile);
+    // Only one close may be pending. Rejected submissions have no result callback.
+    // Leaving Running invalidates the request and suppresses its result.
+    std::optional<std::uint64_t> CloseConnection(std::uint64_t generation, std::string id);
+    // A provider name submits PUT followed by fresh reads of both collections.
+    bool RefreshRules(std::uint64_t generation, std::string providerName = {});
     void Shutdown();
 
     KernelPhase Phase() const;
@@ -173,12 +229,14 @@ private:
     struct SharedState;
     struct LaunchConfig;
     struct ProcessStatus;
-    enum class CommandType { Start, Stop, Restart, SwitchProfile, ProcessExited };
+    enum class CommandType { Start, Stop, Restart, SwitchProfile, CloseConnection, RefreshRules, ProcessExited };
     struct Command {
         CommandType type = CommandType::Start;
         std::uint64_t generation = 0;
         KernelOptions options;
         ProfileSwitchResult profileSwitch;
+        ConnectionCloseResult connectionClose;
+        std::string ruleProviderName;
     };
 
     void Enqueue(Command command);
@@ -197,7 +255,12 @@ private:
     void BeginStartSession(std::uint64_t& generation);
     void Fail(std::uint64_t generation, core::ErrorKind kind, std::string message);
     void Publish();
-    void RecordEventError(std::uint64_t generation, const core::Error& error);
+    void StartEvents(std::uint64_t generation, const KernelOptions& options,
+                     const mihomo::MihomoApiConfig& apiConfig);
+    static void DispatchStreams(const std::shared_ptr<SharedState>& state,
+                                const Dispatcher& dispatcher, std::uint64_t generation);
+    void HandleCloseConnection(ConnectionCloseResult result);
+    void HandleRefreshRules(std::uint64_t generation, const std::string& providerName);
     bool IsCurrent(std::uint64_t generation) const;
     bool Cancelled() const;
     void InterruptibleSleep(int milliseconds) const;

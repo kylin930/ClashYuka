@@ -29,6 +29,9 @@ public:
     virtual ~AppShell() = default;
     virtual void ShowMessage(const wxString& message) = 0;
     virtual void ShowInfoDialog(const wxString& title, const wxString& body) = 0;
+    // Stage a replacement without releasing the current registration.
+    virtual bool PrepareWindowHotkey(const runtime::WindowHotkey&) { return false; }
+    virtual void FinishWindowHotkey(bool /*commit*/) {}
     // Returns true when the user accepts the action.
     virtual bool ShowConfirmDialog(const wxString&, const wxString&, const wxString&) {
         return false;
@@ -73,13 +76,24 @@ public:
     bool SaveKernelSettings(const runtime::AppSettings& settings, wxString* error,
                             bool* restartRequired);
     bool AutoStartKernelEnabled() const { return settings_.autoStartKernel; }
+    bool SaveDesktopSettings(bool closeToTray, const wxString& shortcut, wxString& error);
+    bool WindowHotkeyActive() const { return windowHotkeyActive_; }
+    bool SystemProxyPreferenceAvailable() const { return runtimeInitialized_ && systemProxy_; }
 
     // KernelSessionObserver, always invoked on the GUI thread.
     void OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) override;
     void OnKernelTraffic(double uploadBytesPerSecond, double downloadBytesPerSecond) override;
-    void OnKernelConnections(int count) override;
+    void OnKernelConnections(std::uint64_t generation,
+                             const mihomo::ConnectionsSnapshot& snapshot) override;
+    void OnKernelLogs(std::uint64_t generation,
+                      const std::vector<mihomo::MihomoLogEntry>& batch) override;
+    void OnKernelConnectionClose(const runtime::ConnectionCloseResult& result) override;
+    void ClearLogs();
+    void CloseConnection(std::uint64_t generation, std::string id);
     void OnProxyCatalog(const std::shared_ptr<const runtime::ProxyCatalog>& catalog) override;
 
+    void RefreshRules();
+    void RefreshRuleProvider(std::string name);
     void RefreshProxies();
     void SelectProxy(std::string group, std::string target);
     void ClearProxySelection(std::string group);
@@ -87,6 +101,7 @@ public:
     void TestGroupDelays(std::vector<std::string> names);
     void CancelProxyTests();
     void SetSystemProxyEnabled(bool enabled);
+    void RetrySystemProxy();
 
     void ImportProfile(const wxString& path);
     void RenameProfile(const std::string& id, const wxString& name);
@@ -97,6 +112,10 @@ public:
     void EditSubscription(const std::string& id, const runtime::SubscriptionSettings& settings);
     void RefreshSubscription(const std::string& id);
     void CancelSubscription(const std::string& id);
+
+    void CheckAppUpdate();
+    void CancelAppUpdate();
+    void OpenAppReleasePage();
 
     // Kernel release installation. All network/file work runs on a background
     // worker; snapshots are published on the GUI thread.
@@ -109,6 +128,8 @@ public:
 private:
     void SyncThemeState();
     runtime::KernelOptions BuildKernelOptions() const;
+    void RememberSubscriptionUrls();
+    void RememberSubscriptionUrl(const std::string& url);
     core::Result<runtime::KernelProfile> LoadProfile(const std::string& id) const;
     bool PrepareSelectedKernel();
     void PublishProfiles();
@@ -146,6 +167,7 @@ private:
     std::string profileActionStatus_;
 
     std::unique_ptr<runtime::KernelSession> kernel_;
+    bool confirmingConnectionClose_ = false;
     std::unique_ptr<runtime::ProxyService> proxyService_;
     std::uint64_t proxyServiceGeneration_ = 0;
     std::shared_ptr<int> uiLifetime_;
@@ -155,9 +177,16 @@ private:
     std::string settingsPath_;
     std::string settingsDirectory_;
     bool runtimeInitialized_ = false;
+    bool windowHotkeyActive_ = false;
+    bool systemProxyRecoveryOnly_ = false;
     std::uint64_t lastShownFailure_ = 0;
-    std::uint64_t lastShownEventWarning_ = 0;
+    std::uint64_t lastShownTrafficWarning_ = 0;
     std::uint64_t lastShownProxyError_ = 0;
+
+    void PublishAppUpdate(runtime::AppUpdateSnapshot update);
+    void StopAppUpdate();
+    std::thread appUpdateThread_;
+    std::shared_ptr<std::atomic<bool>> appUpdateCancel_;
 
     std::unique_ptr<runtime::KernelInstaller> installer_;
     std::thread installerThread_;

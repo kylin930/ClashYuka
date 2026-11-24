@@ -6,12 +6,14 @@
 
 #include <wx/string.h>
 
+#include "clashyuka/runtime/kernel_session.h"
 #include "clashyuka/runtime/profile_store.h"
 #include "clashyuka/ui/theme/theme_manager.h"
 
 namespace clashyuka::runtime {
 struct ProxyCatalog;
 struct KernelUpdateSnapshot;
+struct AppUpdateSnapshot;
 }
 
 namespace clashyuka::app {
@@ -20,6 +22,7 @@ enum class PageId {
     Overview,
     Proxies,
     Connections,
+    Rules,
     Profiles,
     Logs,
     Settings,
@@ -57,6 +60,29 @@ struct ProfilesSnapshot {
     bool operator==(const ProfilesSnapshot&) const = default;
 };
 
+struct PendingConnectionClose {
+    std::uint64_t requestId;
+    std::uint64_t generation;
+    std::string connectionId;
+    bool awaitingSnapshot = false;
+
+    bool operator==(const PendingConnectionClose&) const = default;
+};
+
+struct LiveStreamsSnapshot {
+    std::uint64_t generation = 0;
+    bool running = false;
+    bool switching = false;
+    runtime::StreamAvailability logsStatus = runtime::StreamAvailability::Waiting;
+    runtime::StreamAvailability connectionsStatus = runtime::StreamAvailability::Waiting;
+    bool connectionsFresh = false;
+    std::shared_ptr<const std::vector<mihomo::MihomoLogEntry>> logs;
+    std::shared_ptr<const mihomo::ConnectionsSnapshot> connections;
+    std::optional<PendingConnectionClose> pendingClose;
+
+    bool CanClose(std::uint64_t expectedGeneration, std::string_view id) const;
+};
+
 // Immutable-looking snapshot consumed by the shell, pages and (later) the
 // Mihomo integration. The controller is the only component that mutates it.
 struct AppStateSnapshot {
@@ -78,6 +104,9 @@ struct AppStateSnapshot {
     double downloadBytesPerSecond = 0.0;
     bool trafficAvailable = false;
     int connectionCount = 0;
+    LiveStreamsSnapshot live;
+    runtime::RulesSnapshot rules;
+    bool rulesAvailable = false;
 
     std::string kernelPath;
     std::string apiAddress;
@@ -89,10 +118,13 @@ struct AppStateSnapshot {
     // even for large proxy collections.
     std::shared_ptr<const runtime::ProxyCatalog> proxyCatalog;
     std::shared_ptr<const runtime::KernelUpdateSnapshot> kernelUpdate;
+    std::shared_ptr<const runtime::AppUpdateSnapshot> appUpdate;
 
     bool systemProxyEnabled = false;
     bool systemProxyActive = false;
     std::string systemProxyAddress;
+    std::string systemProxyStatus;
+    bool systemProxyRetryAvailable = false;
 };
 
 class AppStateObserver {
@@ -122,17 +154,33 @@ public:
     void SetMihomoVersion(std::string version);
     void SetTraffic(double uploadBytesPerSecond, double downloadBytesPerSecond, bool available);
     void SetConnectionCount(int count);
+    void UpdateLiveStreams(const runtime::KernelSnapshot& kernel);
+    void ResetLiveStreams();
+    void PublishConnections(std::uint64_t generation, const mihomo::ConnectionsSnapshot& snapshot);
+    void AppendLogs(std::uint64_t generation, const std::vector<mihomo::MihomoLogEntry>& batch);
+    void ClearLogs();
+    bool RememberRedaction(std::string value);
+    bool BeginConnectionClose(PendingConnectionClose request);
+    bool FinishConnectionClose(const runtime::ConnectionCloseResult& result);
+    void SetRules(bool available, runtime::RulesSnapshot rules = {});
     void SetKernelPath(std::string path);
     void SetApiAddress(std::string address);
     void SetKernelError(std::string error);
     void SetProxyCatalog(std::shared_ptr<const runtime::ProxyCatalog> catalog);
     void SetKernelUpdate(std::shared_ptr<const runtime::KernelUpdateSnapshot> update);
-    void SetSystemProxy(bool enabled, bool active, std::string address);
+    void SetAppUpdate(std::shared_ptr<const runtime::AppUpdateSnapshot> update);
+    void SetSystemProxy(bool enabled, bool active, std::string address,
+                        std::string status = {}, bool retryAvailable = false);
 
 private:
+    friend class AppController;
+    const std::vector<std::string>& Redactions() const { return redactions_; }
+    std::string Redact(std::string text) const;
+    void ScrubConnections(const mihomo::ConnectionsSnapshot& snapshot, bool fresh);
     void Notify();
 
     AppStateSnapshot snapshot_;
+    std::vector<std::string> redactions_;
     std::vector<AppStateObserver*> observers_;
 };
 

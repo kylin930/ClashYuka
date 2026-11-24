@@ -23,6 +23,9 @@ class NavigationRail;
 class PageBase;
 class StatusBarPanel;
 class TextBlock;
+#ifdef __WXMSW__
+class DesktopTrayIcon;
+#endif
 
 // Root application window: navigation rail, page header, page container and
 // status bar. Implements the shell services used by the controller.
@@ -52,6 +55,21 @@ private:
     void OnSize(wxSizeEvent& event);
     void OnClose(wxCloseEvent& event);
 
+#ifdef __WXMSW__
+    friend class DesktopTrayIcon;
+    bool EnsureTrayIcon();
+    void RestoreWindow();
+    void ToggleWindow();
+    bool PrepareWindowHotkey(const runtime::WindowHotkey& hotkey) override;
+    void FinishWindowHotkey(bool commit) override;
+    void StopDesktopControls();
+    WXLRESULT MSWWindowProc(WXUINT message, WXWPARAM wParam, WXLPARAM lParam) override;
+
+    std::unique_ptr<DesktopTrayIcon> tray_;
+    int activeHotkeyId_ = 0;
+    int pendingHotkeyId_ = 0;
+#endif
+    bool closing_ = false;
     app::AppController controller_;
 
     wxPanel* root_ = nullptr;

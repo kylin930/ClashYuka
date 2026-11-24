@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <system_error>
 #include <utility>
 
 #include <wx/app.h>
@@ -11,6 +12,7 @@
 #include "clashyuka/app/app_text.h"
 #include "clashyuka/app/archive_extractor.h"
 #include "clashyuka/core/timing.h"
+#include "clashyuka/runtime/app_update.h"
 #include "clashyuka/ui/theme/theme_manager.h"
 
 namespace clashyuka::app {
@@ -104,6 +106,7 @@ bool IsSessionActive(const runtime::KernelSession* session) {
 AppController::AppController(AppShell* shell) : shell_(shell) {
     SyncThemeState();
     settings_ = runtime::DefaultSettings();
+    PublishAppUpdate(runtime::InitialAppUpdate());
     Bind(wxEVT_TIMER, [this](wxTimerEvent&) { TickSubscriptions(); });
 }
 
@@ -121,6 +124,10 @@ void AppController::SyncThemeState() {
 
 void AppController::Navigate(PageId page) {
     state_.SetCurrentPage(page);
+    if (page == PageId::Rules && Snapshot().rules.rulesStatus == runtime::RulesLoadStatus::Idle &&
+        !Snapshot().rules.loading) {
+        RefreshRules();
+    }
 }
 
 void AppController::SetDarkMode(bool dark) {
@@ -201,15 +208,36 @@ void AppController::InitializeRuntime() {
         profileStoreError_ = "Could not open profiles: " + opened.error().message;
     }
 
+    state_.RememberRedaction(settings_.secret);
+    RememberSubscriptionUrls();
     uiLifetime_ = std::make_shared<int>(0);
     kernel_ = std::make_unique<runtime::KernelSession>(
         runtime::CreateDefaultDriverFactory(), MakeUiDispatcher());
     kernel_->SetOptions(BuildKernelOptions());
     kernel_->SetObserver(this);
     systemProxy_ = platform::CreateSystemProxyController();
-    state_.SetSystemProxy(settings_.enableSystemProxy, false, "");
+    const auto query = systemProxy_->Query();
+    if (!query) {
+        state_.SetSystemProxy(settings_.enableSystemProxy, false, "",
+                              "Recovery pending or failure: " + query.error().message, true);
+    } else {
+        state_.SetSystemProxy(settings_.enableSystemProxy, false, "",
+                              settings_.enableSystemProxy ? "Waiting for the kernel." : "Off", false);
+    }
     CreateInstaller();
     runtimeInitialized_ = true;
+#ifdef __WXMSW__
+    if (!settings_.windowHotkey.empty() && shell_) {
+        if (const auto hotkey = runtime::ParseWindowHotkey(settings_.windowHotkey);
+            hotkey && shell_->PrepareWindowHotkey(*hotkey)) {
+            shell_->FinishWindowHotkey(true);
+            windowHotkeyActive_ = true;
+        } else {
+            ShowMessage(DesktopText("Could not register the saved window shortcut. It may be in use.",
+                                    "无法注册已保存的窗口快捷键。该组合键可能已被占用。"));
+        }
+    }
+#endif
     PublishProfiles();
     if (subscriptions_ && subscriptions_->Available()) {
         subscriptionTimer_ = std::make_unique<wxTimer>(static_cast<wxEvtHandler*>(this));
@@ -233,6 +261,7 @@ void AppController::InitializeRuntime() {
 
 void AppController::ShutdownRuntime() {
     runtimeInitialized_ = false;
+    windowHotkeyActive_ = false;
     subscriptionTimer_.reset();
     if (subscriptions_) {
         subscriptions_->Shutdown();
@@ -253,6 +282,7 @@ void AppController::ShutdownRuntime() {
         systemProxyPort_ = 0;
     }
     systemProxy_.reset();
+    StopAppUpdate();
     StopInstallerThread();
     uiLifetime_.reset();
     installer_.reset();
@@ -263,6 +293,9 @@ void AppController::ShutdownRuntime() {
     kernel_->SetObserver(nullptr);
     kernel_->Shutdown();
     kernel_.reset();
+    state_.SetRules(false);
+    state_.ResetLiveStreams();
+    lastShownTrafficWarning_ = 0;
     core::MarkStartup("kernel-session-shutdown");
 }
 
@@ -317,7 +350,32 @@ runtime::KernelOptions AppController::BuildKernelOptions() const {
     options.controllerPort = settings_.controllerPort;
     options.mixedPort = settings_.mixedPort;
     options.secret = settings_.secret;
+    options.logRedactions = state_.Redactions();
     return options;
+}
+
+void AppController::RememberSubscriptionUrls() {
+    if (!profileStore_) {
+        return;
+    }
+    for (const auto& profile : profileStore_->ListProfiles()) {
+        if (profile.kind == runtime::ProfileKind::Subscription) {
+            const auto settings = profileStore_->GetSubscriptionSettings(profile.id);
+            if (settings) {
+                RememberSubscriptionUrl(settings.value().url);
+            }
+        }
+    }
+}
+
+void AppController::RememberSubscriptionUrl(const std::string& url) {
+    // Preserve old URLs for the lifetime of the runtime. The running profile
+    // or queued events can still refer to them after edits and deletions.
+    if (state_.RememberRedaction(url) && kernel_) {
+        auto options = kernel_->Options();
+        options.logRedactions = state_.Redactions();
+        kernel_->SetOptions(std::move(options));
+    }
 }
 
 core::Result<runtime::KernelProfile> AppController::LoadProfile(const std::string& id) const {
@@ -530,6 +588,7 @@ void AppController::AddSubscription(const wxString& name, const runtime::Subscri
     }
     auto added = subscriptions_->Add(name.utf8_string(), settings, settings_.downloadProxy);
     if (added) {
+        RememberSubscriptionUrl(settings.url);
         addingSubscription_ = added.value();
     }
     ProfileMessage(added ? wxString("Downloading subscription...")
@@ -545,6 +604,7 @@ void AppController::EditSubscription(const std::string& id, const runtime::Subsc
         ProfileMessage(wxString::FromUTF8(edited.error().message));
         return;
     }
+    RememberSubscriptionUrl(settings.url);
     ProfileMessage(edited.value() ? "Downloading updated subscription..." : "Subscription settings saved.");
 }
 
@@ -596,8 +656,51 @@ void AppController::TickSubscriptions() {
     }
 }
 
-bool AppController::SaveKernelSettings(const runtime::AppSettings& settings, wxString* error,
+bool AppController::SaveDesktopSettings(bool closeToTray, const wxString& shortcut,
+                                        wxString& error) {
+    error.clear();
+    if (!runtimeInitialized_ || !shell_) {
+        error = DesktopText("Desktop settings are unavailable.", "桌面设置暂不可用。");
+        return false;
+    }
+    const auto hotkey = runtime::ParseWindowHotkey(shortcut.utf8_string());
+    if (!hotkey) {
+        error = DesktopText("Enter a shortcut such as Ctrl+Alt+Y, or leave it blank to turn off.",
+                            "请输入类似 Ctrl+Alt+Y 的快捷键，或留空关闭。");
+        return false;
+    }
+    const auto normalized = hotkey->ToString();
+    const bool change = normalized != settings_.windowHotkey ||
+                        (hotkey->key && !windowHotkeyActive_);
+    if (change && !shell_->PrepareWindowHotkey(*hotkey)) {
+        error = DesktopText("Could not register the shortcut. It may be in use. Your settings were not changed.",
+                            "无法注册快捷键。该组合键可能已被占用，设置未更改。");
+        return false;
+    }
+
+    auto next = settings_;
+    next.closeToTray = closeToTray;
+    next.windowHotkey = normalized;
+    const auto saved = runtime::SaveSettings(settingsPath_, next);
+    if (change) {
+        shell_->FinishWindowHotkey(saved.ok());
+    }
+    if (!saved) {
+        error = DesktopText("Could not save the desktop settings. Your settings were not changed.",
+                            "无法保存桌面设置，设置未更改。");
+        return false;
+    }
+    settings_ = std::move(next);
+    windowHotkeyActive_ = hotkey->key != 0;
+    state_.Notify();
+    return true;
+}
+
+bool AppController::SaveKernelSettings(const runtime::AppSettings& requested, wxString* error,
                                        bool* restartRequired) {
+    auto settings = requested;
+    settings.closeToTray = settings_.closeToTray;
+    settings.windowHotkey = settings_.windowHotkey;
     if (error != nullptr) {
         error->clear();
     }
@@ -645,6 +748,7 @@ bool AppController::SaveKernelSettings(const runtime::AppSettings& settings, wxS
         *restartRequired = active;
     }
 
+    state_.RememberRedaction(settings.secret);
     settings_ = settings;
     if (settingsDirectory_.empty()) {
         settingsDirectory_ = PathToUtf8(PathFromUtf8(settingsPath_).parent_path());
@@ -668,10 +772,12 @@ bool AppController::SaveKernelSettings(const runtime::AppSettings& settings, wxS
 }
 
 void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
-    if (!runtimeInitialized_) {
+    if (!runtimeInitialized_ || snapshot.generation < Snapshot().live.generation) {
         return;
     }
+    state_.UpdateLiveStreams(snapshot);
     const bool ready = snapshot.phase == runtime::KernelPhase::Running;
+    state_.SetRules(snapshot.rulesAvailable, snapshot.rules);
     runningProfileId_ = ready ? snapshot.runningProfileId : std::string{};
     if (ready && !launchProfileId_.empty() && launchProfileId_ == runningProfileId_) {
         runningRevision_ = launchRevision_;
@@ -683,7 +789,6 @@ void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
         DestroyProxyService();
         state_.SetProxyCatalog(nullptr);
         state_.SetTraffic(0.0, 0.0, false);
-        state_.SetConnectionCount(0);
     }
     if (!snapshot.apiAddress.empty()) {
         state_.SetApiAddress(snapshot.apiAddress);
@@ -710,8 +815,8 @@ void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
             state_.SetKernelError(friendly.utf8_string());
             if (snapshot.generation != lastShownFailure_) {
                 lastShownFailure_ = snapshot.generation;
-                std::fprintf(stderr, "[clashyuka] kernel failure: %s\n",
-                             snapshot.error.message.c_str());
+                std::fprintf(stderr, "[clashyuka] kernel failure (kind %d)\n",
+                             static_cast<int>(snapshot.error.kind));
                 if (!friendly.empty()) {
                     ShowMessage(friendly);
                 }
@@ -726,9 +831,8 @@ void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
         case runtime::KernelPhase::Stopping:
             break;
     }
-    if (!ready) {
+    if (!ready || snapshot.trafficStream.availability != runtime::StreamAvailability::Available) {
         state_.SetTraffic(0.0, 0.0, false);
-        state_.SetConnectionCount(0);
     }
     if (snapshot.profileSwitchResult && pendingProfileSwitch_ == snapshot.profileSwitchResult->requestId &&
         snapshot.profileSwitchResult->outcome == runtime::ProfileSwitchOutcome::RollbackFailed) {
@@ -737,12 +841,14 @@ void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
     ConsumeProfileSwitch(snapshot);
     PublishProfiles();
 
-    if (!snapshot.eventError.empty() &&
-        snapshot.generation != lastShownEventWarning_) {
-        lastShownEventWarning_ = snapshot.generation;
-        std::fprintf(stderr, "[clashyuka] event stream warning: %s\n",
-                     snapshot.eventError.c_str());
-        ShowMessage("Live event stream is unavailable. Traffic data may be missing.");
+    if (ready && snapshot.trafficStream.availability == runtime::StreamAvailability::Disconnected &&
+        snapshot.generation != lastShownTrafficWarning_) {
+        lastShownTrafficWarning_ = snapshot.generation;
+        ShowMessage("Live traffic data is unavailable.");
+    }
+    if (Snapshot().currentPage == PageId::Rules && Snapshot().rulesAvailable &&
+        Snapshot().rules.rulesStatus == runtime::RulesLoadStatus::Idle && !Snapshot().rules.loading) {
+        RefreshRules();
     }
 }
 
@@ -751,8 +857,62 @@ void AppController::OnKernelTraffic(double uploadBytesPerSecond,
     state_.SetTraffic(uploadBytesPerSecond, downloadBytesPerSecond, true);
 }
 
-void AppController::OnKernelConnections(int count) {
-    state_.SetConnectionCount(count);
+void AppController::OnKernelConnections(std::uint64_t generation,
+                                        const mihomo::ConnectionsSnapshot& snapshot) {
+    if (runtimeInitialized_) {
+        state_.PublishConnections(generation, snapshot);
+    }
+}
+
+void AppController::OnKernelLogs(std::uint64_t generation,
+                                 const std::vector<mihomo::MihomoLogEntry>& batch) {
+    if (runtimeInitialized_) {
+        state_.AppendLogs(generation, batch);
+    }
+}
+
+void AppController::ClearLogs() {
+    state_.ClearLogs();
+}
+
+void AppController::CloseConnection(std::uint64_t generation, std::string id) {
+    const auto canClose = [&] {
+        if (!kernel_ || !Snapshot().live.CanClose(generation, id)) {
+            return false;
+        }
+        const auto current = kernel_->Snapshot();
+        return current.generation == generation && current.phase == runtime::KernelPhase::Running &&
+               !current.profileSwitchInProgress &&
+               current.connectionStream.availability == runtime::StreamAvailability::Available;
+    };
+    if (confirmingConnectionClose_ || !shell_ || !canClose()) {
+        return;
+    }
+    confirmingConnectionClose_ = true;
+    const bool confirmed = shell_->ShowConfirmDialog(
+        "Close connection?", "Close the selected connection now? The application may reconnect.",
+        "Close connection");
+    confirmingConnectionClose_ = false;
+    if (!confirmed) {
+        return;
+    }
+    // The modal dialog pumps events. Revalidate the captured generation and ID.
+    if (!canClose()) {
+        ShowMessage("The selected connection is no longer available to close.");
+        return;
+    }
+    if (const auto request = kernel_->CloseConnection(generation, id)) {
+        state_.BeginConnectionClose({*request, generation, std::move(id)});
+    } else {
+        ShowMessage("The selected connection is no longer available to close.");
+    }
+}
+
+void AppController::OnKernelConnectionClose(const runtime::ConnectionCloseResult& result) {
+    if (runtimeInitialized_ && state_.FinishConnectionClose(result)) {
+        ShowMessage(result.error ? "Could not close the selected connection."
+                                 : "Connection close accepted. Waiting for the live list to update.");
+    }
 }
 
 void AppController::CreateProxyService() {
@@ -777,6 +937,18 @@ void AppController::DestroyProxyService() {
     proxyService_->SetObserver(nullptr);
     proxyService_->Shutdown();
     proxyService_.reset();
+}
+
+void AppController::RefreshRules() {
+    if (kernel_ && Snapshot().rulesAvailable) {
+        kernel_->RefreshRules(Snapshot().live.generation);
+    }
+}
+
+void AppController::RefreshRuleProvider(std::string name) {
+    if (kernel_ && Snapshot().rulesAvailable && !name.empty()) {
+        kernel_->RefreshRules(Snapshot().live.generation, std::move(name));
+    }
 }
 
 void AppController::RefreshProxies() {
@@ -828,33 +1000,40 @@ void AppController::SyncSystemProxy() {
     const auto session = kernel_ ? kernel_->Snapshot() : runtime::KernelSnapshot{};
     const bool running = session.phase == runtime::KernelPhase::Running;
     const int port = session.mixedPort;
-    const bool shouldApply = settings_.enableSystemProxy && running && port > 0 && port <= 65535;
+    const bool shouldApply = !systemProxyRecoveryOnly_ && settings_.enableSystemProxy && running && port > 0 && port <= 65535;
     if (!shouldApply) {
         if (systemProxy_->Active()) {
             const core::Result<void> disabled = systemProxy_->Disable();
             if (!disabled) {
-                ShowMessage(wxString::FromUTF8("System proxy: " + disabled.error().message));
+                state_.SetSystemProxy(settings_.enableSystemProxy, true,
+                                      "127.0.0.1:" + std::to_string(systemProxyPort_),
+                                      "Recovery pending: " + disabled.error().message, true);
+                return;
             }
         }
         if (!systemProxy_->Active()) {
             systemProxyPort_ = 0;
         }
-        state_.SetSystemProxy(settings_.enableSystemProxy, systemProxy_->Active(),
-                              systemProxy_->ActiveServer());
-        if (settings_.enableSystemProxy && running) {
-            ShowMessage("System proxy requires an enabled Mihomo mixed port.");
-        }
+        const bool active = systemProxy_->Active();
+        const std::string status = active ? "Active" :
+            (!settings_.enableSystemProxy ? "Off" :
+             (running ? "Waiting for a valid mixed port." : "Waiting for the kernel."));
+        state_.SetSystemProxy(settings_.enableSystemProxy, active,
+                              active ? systemProxy_->ActiveServer() : "", status,
+                              !active && (running || !settings_.enableSystemProxy));
         return;
     }
 
     if (systemProxy_->Active() && systemProxyPort_ == port) {
-        state_.SetSystemProxy(true, true, systemProxy_->ActiveServer());
+        state_.SetSystemProxy(true, true, "127.0.0.1:" + std::to_string(port), "Active", false);
         return;
     }
     if (systemProxy_->Active()) {
         const auto disabled = systemProxy_->Disable();
         if (!disabled) {
-            ShowMessage(wxString::FromUTF8("System proxy: " + disabled.error().message));
+            state_.SetSystemProxy(settings_.enableSystemProxy, true,
+                                  "127.0.0.1:" + std::to_string(systemProxyPort_),
+                                  "Recovery pending: " + disabled.error().message, true);
             return;
         }
         systemProxyPort_ = 0;
@@ -862,16 +1041,47 @@ void AppController::SyncSystemProxy() {
     const core::Result<void> enabled = systemProxy_->Enable(
         "127.0.0.1", port, platform::DefaultSystemProxyBypass());
     if (!enabled) {
-        state_.SetSystemProxy(settings_.enableSystemProxy, systemProxy_->Active(),
-                              systemProxy_->ActiveServer());
+        const bool recoverable = !settings_.enableSystemProxy || systemProxy_->Active();
+        state_.SetSystemProxy(settings_.enableSystemProxy, false, "",
+                              "Failure: " + enabled.error().message, recoverable);
         ShowMessage(wxString::FromUTF8("System proxy: " + enabled.error().message));
         return;
     }
     systemProxyPort_ = port;
-    state_.SetSystemProxy(true, true, systemProxy_->ActiveServer());
+    state_.SetSystemProxy(true, true, "127.0.0.1:" + std::to_string(port), "Active", false);
+}
+
+void AppController::RetrySystemProxy() {
+    if (!systemProxy_ || !state_.Get().systemProxyRetryAvailable) {
+        return;
+    }
+    if (!systemProxy_->Active()) {
+        systemProxy_.reset();
+        systemProxy_ = platform::CreateSystemProxyController();
+    }
+    const auto restored = systemProxy_->Disable();
+    if (!restored) {
+        state_.SetSystemProxy(settings_.enableSystemProxy, systemProxy_->Active(),
+                              systemProxy_->Active() ? "127.0.0.1:" + std::to_string(systemProxyPort_) : "",
+                              "Recovery pending: " + restored.error().message, true);
+        return;
+    }
+    systemProxyPort_ = 0;
+    systemProxyRecoveryOnly_ = true;
+    const auto recovered = systemProxy_->Query();
+    if (!recovered) {
+        state_.SetSystemProxy(settings_.enableSystemProxy, false, "",
+                              "Recovery pending or failure: " + recovered.error().message, true);
+        return;
+    }
+    state_.SetSystemProxy(settings_.enableSystemProxy, false, "",
+                          settings_.enableSystemProxy ? "Recovery complete. Waiting for the next lifecycle action."
+                                                      : "Off",
+                          false);
 }
 
 void AppController::SetSystemProxyEnabled(bool enabled) {
+    systemProxyRecoveryOnly_ = false;
     if (settings_.enableSystemProxy == enabled) {
         SyncSystemProxy();
         return;
@@ -981,6 +1191,74 @@ void AppController::StopInstallerThread() {
         installerThread_.join();
     }
     installerBusy_.store(false);
+}
+
+void AppController::PublishAppUpdate(runtime::AppUpdateSnapshot update) {
+    state_.SetAppUpdate(std::make_shared<const runtime::AppUpdateSnapshot>(std::move(update)));
+}
+
+void AppController::CheckAppUpdate() {
+    using Status = runtime::AppUpdateStatus;
+    if (appUpdateCancel_ || wxTheApp == nullptr ||
+        Snapshot().appUpdate->status == Status::Unavailable) {
+        return;
+    }
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    appUpdateCancel_ = cancel;
+    try {
+        appUpdateThread_ = std::thread([this, cancel] {
+            runtime::AppUpdateSnapshot result;
+            try {
+                result = runtime::CheckOfficialAppUpdate(*cancel);
+            } catch (const std::exception&) {
+                result.status = Status::Failed;
+                result.message = "Could not check for app updates. Try again.";
+            }
+            const std::weak_ptr<std::atomic<bool>> request = cancel;
+            wxTheApp->CallAfter([this, request, result = std::move(result)]() mutable {
+                const auto active = request.lock();
+                if (!active) {
+                    return;  // Shutdown invalidated the queued result.
+                }
+                appUpdateThread_.join();
+                appUpdateCancel_.reset();
+                if (active->load()) {
+                    result = {};
+                    result.status = Status::Cancelled;
+                }
+                PublishAppUpdate(std::move(result));
+            });
+        });
+    } catch (const std::system_error&) {
+        appUpdateCancel_.reset();
+        PublishAppUpdate({Status::Failed, {}, {}, {}, "Could not start the update check. Try again."});
+        return;
+    }
+    PublishAppUpdate({Status::Checking, {}, {}, {}, {}});
+}
+
+void AppController::CancelAppUpdate() {
+    using Status = runtime::AppUpdateStatus;
+    if (appUpdateCancel_ && !appUpdateCancel_->exchange(true)) {
+        PublishAppUpdate({Status::Cancelling, {}, {}, {}, {}});
+    }
+}
+
+void AppController::StopAppUpdate() {
+    if (appUpdateCancel_) {
+        appUpdateCancel_->store(true);
+        appUpdateThread_.join();
+        appUpdateCancel_.reset();
+        PublishAppUpdate(runtime::InitialAppUpdate());
+    }
+}
+
+void AppController::OpenAppReleasePage() {
+    const auto update = Snapshot().appUpdate;
+    if (update->status == runtime::AppUpdateStatus::Available && !update->releasePage.empty() &&
+        !wxLaunchDefaultBrowser(wxString::FromUTF8(update->releasePage))) {
+        ShowMessage("Could not open the official release page.");
+    }
 }
 
 void AppController::CheckKernelUpdate() {

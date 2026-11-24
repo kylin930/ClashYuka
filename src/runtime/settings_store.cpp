@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 using core::ErrorKind;
 using core::MakeError;
 
-constexpr int kSettingsVersion = 3;
+constexpr int kSettingsVersion = 4;
 
 fs::path PathFromUtf8(const std::string& value) {
     return fs::path(std::u8string(value.begin(), value.end()));
@@ -70,6 +70,8 @@ core::Result<void> WriteSettingsFile(const fs::path& path, const AppSettings& se
     root["kernelInstallDir"] = settings.kernelInstallDir;
     root["downloadProxy"] = settings.downloadProxy;
     root["enableSystemProxy"] = settings.enableSystemProxy;
+    root["closeToTray"] = settings.closeToTray;
+    root["windowHotkey"] = settings.windowHotkey;
 
     {
         std::ofstream output(temp, std::ios::binary | std::ios::trunc);
@@ -103,6 +105,60 @@ core::Result<void> WriteSettingsFile(const fs::path& path, const AppSettings& se
 }
 
 }  // namespace
+
+std::string WindowHotkey::ToString() const {
+    if (!key) {
+        return {};
+    }
+    std::string text;
+    if (ctrl) text += "Ctrl+";
+    if (alt) text += "Alt+";
+    if (shift) text += "Shift+";
+    if (win) text += "Win+";
+    return text + key;
+}
+
+std::optional<WindowHotkey> ParseWindowHotkey(std::string_view text) {
+    const auto trim = [](std::string_view piece) {
+        const auto start = piece.find_first_not_of(" \t");
+        return start == std::string_view::npos
+                   ? std::string_view{}
+                   : piece.substr(start, piece.find_last_not_of(" \t") - start + 1);
+    };
+    text = trim(text);
+    WindowHotkey hotkey;
+    if (text.empty()) {
+        return hotkey;
+    }
+    for (auto split = text.find('+'); split != std::string_view::npos; split = text.find('+')) {
+        const auto modifier = trim(text.substr(0, split));
+        std::string lower(modifier);
+        for (char& c : lower) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        }
+        bool* flag = nullptr;
+        if (lower == "ctrl") flag = &hotkey.ctrl;
+        if (lower == "alt") flag = &hotkey.alt;
+        if (lower == "shift") flag = &hotkey.shift;
+        if (lower == "win") flag = &hotkey.win;
+        if (flag == nullptr || *flag) {
+            return std::nullopt;
+        }
+        *flag = true;
+        text.remove_prefix(split + 1);
+    }
+    text = trim(text);
+    if (text.size() != 1 || !(hotkey.ctrl || hotkey.alt || hotkey.win)) {
+        return std::nullopt;
+    }
+    char key = text.front();
+    if (key >= 'a' && key <= 'z') key = static_cast<char>(key - 'a' + 'A');
+    if (!((key >= 'A' && key <= 'Z') || (key >= '0' && key <= '9'))) {
+        return std::nullopt;
+    }
+    hotkey.key = key;
+    return hotkey;
+}
 
 std::string GenerateLocalSecret() {
     std::random_device device;
@@ -172,6 +228,22 @@ SettingsLoadResult LoadSettings(const std::string& path) {
     partial |= !ReadString(root, "kernelInstallDir", settings.kernelInstallDir);
     partial |= !ReadString(root, "downloadProxy", settings.downloadProxy);
     partial |= !ReadBool(root, "enableSystemProxy", settings.enableSystemProxy);
+    // Optional for settings files saved before desktop controls were added.
+    if (root.contains("closeToTray")) {
+        partial |= !ReadBool(root, "closeToTray", settings.closeToTray);
+    }
+    if (root.contains("windowHotkey")) {
+        std::string text;
+        if (ReadString(root, "windowHotkey", text)) {
+            if (const auto parsed = ParseWindowHotkey(text)) {
+                settings.windowHotkey = parsed->ToString();
+            } else {
+                partial = true;
+            }
+        } else {
+            partial = true;
+        }
+    }
 
     if (settings.secret.empty()) {
         settings.secret = GenerateLocalSecret();
@@ -229,6 +301,9 @@ core::Result<void> ValidateSettings(const AppSettings& settings) {
     if (settings.proxyTestTimeoutMs < 1000 || settings.proxyTestTimeoutMs > 60000) {
         return MakeError(ErrorKind::InvalidConfig,
                          "the proxy delay timeout must be between 1000 and 60000 ms");
+    }
+    if (!ParseWindowHotkey(settings.windowHotkey)) {
+        return MakeError(ErrorKind::InvalidConfig, "the global window shortcut is invalid");
     }
     if (!settings.downloadProxy.empty() &&
         settings.downloadProxy.rfind("http://", 0) != 0 &&

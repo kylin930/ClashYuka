@@ -10,6 +10,7 @@
 #include "clashyuka/app/app_controller.h"
 #include "clashyuka/app/app_text.h"
 #include "clashyuka/core/app_info.h"
+#include "clashyuka/runtime/app_update.h"
 #include "clashyuka/runtime/settings_store.h"
 #include "clashyuka/ui/components/button.h"
 #include "clashyuka/ui/components/list_item.h"
@@ -63,9 +64,7 @@ SettingsPage::SettingsPage(wxWindow* parent, app::AppController& controller)
     : PageBase(parent, controller, app::PageId::Settings) {
     auto* sizer = new wxBoxSizer(wxVERTICAL);
 
-    sizer->Add(new TextBlock(this,
-                             "Appearance settings apply immediately. The other groups are "
-                             "placeholders for later stages.",
+    sizer->Add(new TextBlock(this, "Appearance settings apply immediately.",
                              TypeStyle::Label, 170),
                0, wxEXPAND);
     pages::AddSpacer(sizer, this, SpaceDp(Space::Lg));
@@ -128,10 +127,52 @@ SettingsPage::SettingsPage(wxWindow* parent, app::AppController& controller)
     generalSizer->Add(MakeDisabledItem(general, "Minimize behavior",
                                        "Keep running in the background", "Not implemented"),
                       0, wxEXPAND);
-    generalSizer->Add(MakeDisabledItem(general, "Close behavior",
-                                       "Stop the core when the window closes", "Not implemented"),
-                      0, wxEXPAND);
     sizer->Add(general, 0, wxEXPAND);
+
+#ifdef __WXMSW__
+    using app::DesktopText;
+    pages::AddSpacer(sizer, this, SpaceDp(Space::Lg));
+    wxSizer* desktopSizer = nullptr;
+    auto* desktop = MakeSection(this, DesktopText("Desktop controls", "桌面控制"), &desktopSizer);
+    closeToTray_ = new Switch(desktop);
+    const auto closeLabel = DesktopText("Close to the system tray", "关闭窗口时隐藏到系统托盘");
+    closeToTray_->SetName(closeLabel);
+    AddSettingRow(desktopSizer, desktop, closeLabel, closeToTray_);
+    pages::AddSpacer(desktopSizer, desktop, SpaceDp(Space::Sm));
+    AddParagraph(desktopSizer, desktop,
+                 DesktopText("To quit while the window is hidden, choose Exit ClashYuka in the tray.",
+                             "窗口隐藏后，可从系统托盘菜单选择退出 ClashYuka。"));
+    pages::AddSpacer(desktopSizer, desktop, SpaceDp(Space::Md));
+    const auto hotkeyLabel = DesktopText("Global window shortcut", "全局窗口快捷键");
+    desktopSizer->Add(new TextBlock(desktop, hotkeyLabel, TypeStyle::Body), 0, wxEXPAND);
+    pages::AddSpacer(desktopSizer, desktop, SpaceDp(Space::Xs));
+    auto* hotkeyRow = new wxBoxSizer(wxHORIZONTAL);
+    windowHotkey_ = new SearchField(desktop, "Ctrl+Alt+Y", std::nullopt);
+    windowHotkey_->SetName(hotkeyLabel);
+    hotkeyRow->Add(windowHotkey_, 1, wxEXPAND | wxRIGHT, FromDIP(SpaceDp(Space::Sm)));
+    saveDesktop_ = new Button(desktop, DesktopText("Save desktop settings", "保存桌面设置"),
+                              ButtonVariant::Filled);
+    saveDesktop_->SetOnClick([this] {
+        wxString error;
+        if (Controller().SaveDesktopSettings(closeToTray_->GetValue(), windowHotkey_->GetValue(), error)) {
+            SyncDesktopSettings(true);
+            Controller().ShowMessage(app::DesktopText("Desktop settings saved.", "桌面设置已保存。"));
+        } else {
+            Controller().ShowMessage(error);
+        }
+    });
+    hotkeyRow->Add(saveDesktop_, 0, wxALIGN_CENTER_VERTICAL);
+    desktopSizer->Add(hotkeyRow, 0, wxEXPAND);
+    pages::AddSpacer(desktopSizer, desktop, SpaceDp(Space::Xs));
+    AddParagraph(desktopSizer, desktop,
+                 DesktopText("Use Ctrl, Alt, or Win with a letter or digit. Shift is optional.",
+                             "使用 Ctrl、Alt 或 Win 搭配字母或数字，也可加上 Shift。"));
+    AddParagraph(desktopSizer, desktop,
+                 DesktopText("Leave blank to turn off the shortcut.", "留空即可关闭快捷键。"));
+    desktopStatus_ = new TextBlock(desktop, "", TypeStyle::Label, 180);
+    desktopSizer->Add(desktopStatus_, 0, wxEXPAND | wxTOP, FromDIP(SpaceDp(Space::Xs)));
+    sizer->Add(desktop, 0, wxEXPAND);
+#endif
 
     pages::AddSpacer(sizer, this, SpaceDp(Space::Lg));
 
@@ -204,9 +245,31 @@ SettingsPage::SettingsPage(wxWindow* parent, app::AppController& controller)
 
     pages::AddSpacer(sizer, this, SpaceDp(Space::Lg));
 
-    // --- Kernel updates ----------------------------------------------------
+    // --- ClashYuka updates -------------------------------------------------
+    wxSizer* appUpdateSizer = nullptr;
+    auto* appUpdateCard = MakeSection(this, "ClashYuka updates", &appUpdateSizer);
+    AddParagraph(appUpdateSizer, appUpdateCard,
+                 wxString::FromUTF8("Current version: " + std::string(runtime::AppBuildVersion())), 200);
+    appUpdateLine_ = new TextBlock(appUpdateCard, "", TypeStyle::Label, 170);
+    appUpdateSizer->Add(appUpdateLine_, 0, wxEXPAND);
+    pages::AddSpacer(appUpdateSizer, appUpdateCard, SpaceDp(Space::Md));
+    auto* appUpdateButtons = new wxBoxSizer(wxHORIZONTAL);
+    checkAppUpdate_ = new Button(appUpdateCard, "Check for updates", ButtonVariant::FilledTonal);
+    checkAppUpdate_->SetOnClick([this] { Controller().CheckAppUpdate(); });
+    cancelAppUpdate_ = new Button(appUpdateCard, "Cancel", ButtonVariant::Text);
+    cancelAppUpdate_->SetOnClick([this] { Controller().CancelAppUpdate(); });
+    openAppRelease_ = new Button(appUpdateCard, "Open official release", ButtonVariant::Outlined);
+    openAppRelease_->SetOnClick([this] { Controller().OpenAppReleasePage(); });
+    appUpdateButtons->Add(checkAppUpdate_, 0, wxRIGHT, FromDIP(SpaceDp(Space::Sm)));
+    appUpdateButtons->Add(cancelAppUpdate_, 0, wxRIGHT, FromDIP(SpaceDp(Space::Sm)));
+    appUpdateButtons->Add(openAppRelease_, 0);
+    appUpdateSizer->Add(appUpdateButtons, 0, wxEXPAND);
+    sizer->Add(appUpdateCard, 0, wxEXPAND);
+    pages::AddSpacer(sizer, this, SpaceDp(Space::Lg));
+
+    // --- Mihomo updates ----------------------------------------------------
     wxSizer* updateSizer = nullptr;
-    auto* updateCard = MakeSection(this, "Kernel updates", &updateSizer);
+    auto* updateCard = MakeSection(this, "Mihomo updates", &updateSizer);
     kernelUpdateLine_ = new TextBlock(updateCard, "No update check yet.", TypeStyle::Label,
                                       170);
     updateSizer->Add(kernelUpdateLine_, 0, wxEXPAND);
@@ -279,6 +342,10 @@ SettingsPage::SettingsPage(wxWindow* parent, app::AppController& controller)
     networkSizer->Add(systemProxyRow, 0, wxEXPAND);
     systemProxyStatus_ = new TextBlock(network, "Off", TypeStyle::Label, 170);
     networkSizer->Add(systemProxyStatus_, 0, wxEXPAND | wxTOP, FromDIP(SpaceDp(Space::Xs)));
+    systemProxyRetry_ = new Button(network, "Retry system proxy", ButtonVariant::Text);
+    systemProxyRetry_->SetOnClick([this] { Controller().RetrySystemProxy(); });
+    systemProxyRetry_->Show(false);
+    networkSizer->Add(systemProxyRetry_, 0, wxALIGN_LEFT);
     pages::AddSpacer(networkSizer, network, SpaceDp(Space::Md));
     networkSizer->Add(MakeDisabledItem(network, "TUN mode", "Virtual network adapter",
                                        "Not implemented"),
@@ -292,7 +359,7 @@ SettingsPage::SettingsPage(wxWindow* parent, app::AppController& controller)
     auto* about = MakeSection(this, "About", &aboutSizer);
     aboutSizer->Add(new TextBlock(about, "ClashYuka", TypeStyle::Headline), 0, wxEXPAND);
     AddParagraph(aboutSizer, about,
-                 wxString::FromUTF8("Version 0.2.0 · P2.2 runtime integration"), 200);
+                 wxString::FromUTF8("Version " + std::string(runtime::AppBuildVersion())), 200);
     pages::AddSpacer(aboutSizer, about, SpaceDp(Space::Sm));
     AddParagraph(aboutSizer, about,
                  wxString::FromUTF8("C++20 · wxWidgets 3.3.1 · MD3 painted with "
@@ -302,16 +369,6 @@ SettingsPage::SettingsPage(wxWindow* parent, app::AppController& controller)
         wxString::FromUTF8(info.platformName + " · " + info.compiler + " · " +
                            (info.elevated ? "elevated" : "standard user"));
     AddParagraph(aboutSizer, about, platformLine, 170);
-    pages::AddSpacer(aboutSizer, about, SpaceDp(Space::Md));
-
-    auto* project = new ListItem(about);
-    project->SetTitle("Project page");
-    project->SetSubtitle("No repository URL is configured in this build");
-    project->SetTrailingText(wxString::FromUTF8("—"));
-    project->SetLeadingIcon(IconId::Info);
-    project->SetShowChevron(false);
-    project->Enable(false);
-    aboutSizer->Add(project, 0, wxEXPAND);
     sizer->Add(about, 0, wxEXPAND);
 
     SetSizer(sizer);
@@ -333,19 +390,22 @@ void SettingsPage::ApplyState(const app::AppStateSnapshot& state) {
     }
     animations_->SetValue(state.animationsEnabled, false);
     reducedMotion_->SetValue(state.reducedMotion, false);
+#ifdef __WXMSW__
+    SyncDesktopSettings();
+#endif
     if (systemProxy_ != nullptr) {
         systemProxy_->SetValue(state.systemProxyEnabled, false);
     }
     if (systemProxyStatus_ != nullptr) {
         if (state.systemProxyActive) {
             systemProxyStatus_->SetText(wxString::FromUTF8(
-                "Active at " + state.systemProxyAddress +
-                ". The previous OS proxy is restored when the kernel stops."));
-        } else if (state.systemProxyEnabled) {
-            systemProxyStatus_->SetText("Enabled; applies when the kernel is running.");
+                "Active at " + state.systemProxyAddress + ". " + state.systemProxyStatus));
         } else {
-            systemProxyStatus_->SetText("Off");
+            systemProxyStatus_->SetText(wxString::FromUTF8(state.systemProxyStatus.empty()
+                                                               ? "Off"
+                                                               : state.systemProxyStatus));
         }
+        systemProxyRetry_->Show(state.systemProxyRetryAvailable);
     }
 
     if (kernelStatusLine_ != nullptr) {
@@ -356,12 +416,44 @@ void SettingsPage::ApplyState(const app::AppStateSnapshot& state) {
         SyncMihomoSettings();
         mihomoFieldsInitialized_ = true;
     }
+    if (state.appUpdate && state.appUpdate != shownAppUpdate_) {
+        shownAppUpdate_ = state.appUpdate;
+        ApplyAppUpdate(*shownAppUpdate_);
+    }
     if (!updateApplied_ || state.kernelUpdate.get() != shownUpdate_) {
         updateApplied_ = true;
         shownUpdate_ = state.kernelUpdate.get();
         ApplyKernelUpdate(state);
     }
 }
+
+#ifdef __WXMSW__
+void SettingsPage::SyncDesktopSettings(bool resetFields) {
+    using app::DesktopText;
+    const bool ready = Controller().RuntimeInitialized();
+    if (saveDesktop_->IsEnabled() != ready) {
+        closeToTray_->Enable(ready);
+        windowHotkey_->Enable(ready);
+        saveDesktop_->Enable(ready);
+    }
+    if (!ready) {
+        return;
+    }
+    const auto& settings = Controller().Settings();
+    if (resetFields || !desktopFieldsInitialized_) {
+        closeToTray_->SetValue(settings.closeToTray, false);
+        windowHotkey_->SetValue(wxString::FromUTF8(settings.windowHotkey));
+        desktopFieldsInitialized_ = true;
+        desktopStatus_->SetText(settings.windowHotkey.empty()
+            ? DesktopText("Shortcut off", "快捷键已关闭")
+            : Controller().WindowHotkeyActive()
+                ? DesktopText("Active shortcut: ", "当前快捷键：") + wxString::FromUTF8(settings.windowHotkey)
+                : DesktopText("Saved shortcut is unavailable. Try again or choose another.",
+                              "已保存的快捷键不可用。请重试或更换组合键。"));
+        RequestRelayout();
+    }
+}
+#endif
 
 void SettingsPage::SyncMihomoSettings() {
     const runtime::AppSettings& settings = Controller().Settings();
@@ -374,6 +466,46 @@ void SettingsPage::SyncMihomoSettings() {
     testTimeoutField_->SetValue(wxString::Format("%d", settings.proxyTestTimeoutMs));
     installDirField_->SetValue(wxString::FromUTF8(settings.kernelInstallDir));
     downloadProxyField_->SetValue(wxString::FromUTF8(settings.downloadProxy));
+}
+
+void SettingsPage::ApplyAppUpdate(const runtime::AppUpdateSnapshot& update) {
+    using Status = runtime::AppUpdateStatus;
+    checkAppUpdate_->Enable(update.status != Status::Unavailable &&
+                            update.status != Status::Checking && update.status != Status::Cancelling);
+    cancelAppUpdate_->Enable(update.status == Status::Checking);
+    openAppRelease_->Enable(update.status == Status::Available);
+
+    wxString text;
+    switch (update.status) {
+        case Status::Unavailable:
+        case Status::Failed:
+            text = wxString::FromUTF8(update.message);
+            break;
+        case Status::Idle:
+            text = "No update check yet.";
+            break;
+        case Status::Checking:
+            text = "Checking the official release source...";
+            break;
+        case Status::Cancelling:
+            text = "Cancelling the update check...";
+            break;
+        case Status::Cancelled:
+            text = "Update check cancelled.";
+            break;
+        case Status::Current:
+            text = wxString::FromUTF8("You’re up to date. Latest release: " + update.latestVersion);
+            break;
+        case Status::Available:
+            text = wxString::FromUTF8("Available version: " + update.latestVersion + " · " + update.assetName);
+            break;
+        case Status::NoAsset:
+            text = wxString::FromUTF8("Release " + update.latestVersion +
+                                      " has no compatible package for this build.");
+            break;
+    }
+    appUpdateLine_->SetText(text);
+    RequestRelayout();
 }
 
 void SettingsPage::ApplyKernelUpdate(const app::AppStateSnapshot& state) {

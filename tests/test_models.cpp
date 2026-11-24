@@ -133,8 +133,14 @@ TEST_CASE("rules JSON parsing") {
     REQUIRE(parsed);
     REQUIRE(parsed.value().size() == 2);
     CHECK(parsed.value()[0].index == 0);
+    CHECK(parsed.value()[0].payload == "example.com");
     CHECK(parsed.value()[1].index == 1);
+    CHECK(parsed.value()[1].payload == "CN");
     CHECK(parsed.value()[1].size == 1234);
+
+    auto empty = mihomo::ParseRules(json::parse(R"({"rules":[]})"));
+    REQUIRE(empty);
+    CHECK(empty.value().empty());
 }
 
 TEST_CASE("runtime configuration parsing keeps unknown fields") {
@@ -179,13 +185,13 @@ TEST_CASE("traffic, memory and log JSON parsing") {
     CHECK(log.value().payload == "hello");
 
     auto badLog = mihomo::ParseLog(json::parse(R"({"type":5})"));
-    REQUIRE(badLog);
-    CHECK(badLog.value().payload.empty());
+    CHECK_FALSE(badLog);
+    CHECK_FALSE(mihomo::ParseLog(json::parse(R"({"type":"info","payload":42})")));
 }
 
 TEST_CASE("connections JSON parsing handles nulls and empty arrays") {
     const auto payload = json::parse(R"({
-        "downloadTotal": 100,
+        "downloadTotal": 9007199254740993,
         "uploadTotal": 200,
         "memory": 300,
         "connections": [
@@ -200,7 +206,7 @@ TEST_CASE("connections JSON parsing handles nulls and empty arrays") {
                     "type": "HTTP",
                     "sourceIP": "127.0.0.1",
                     "destinationIP": "1.1.1.1",
-                    "sourcePort": 1234,
+                    "sourcePort": "1234",
                     "destinationPort": 80,
                     "host": "example.com",
                     "metadata-only": true
@@ -216,12 +222,19 @@ TEST_CASE("connections JSON parsing handles nulls and empty arrays") {
     auto parsed = mihomo::ParseConnections(payload);
     REQUIRE(parsed);
     CHECK(parsed.value().connections.size() == 2);
+    CHECK(parsed.value().downloadTotal == 9007199254740993ULL);
+    CHECK(parsed.value().connections[0].metadata.sourcePort == 1234);
     CHECK(parsed.value().connections[0].metadata.destinationPort == 80);
     CHECK(parsed.value().connections[0].chains.size() == 1);
 
     auto empty = mihomo::ParseConnections(json::parse(R"({"connections":[]})"));
     REQUIRE(empty);
     CHECK(empty.value().connections.empty());
+    auto nil = mihomo::ParseConnections(json::parse(R"({"connections":null})"));
+    REQUIRE(nil);
+    CHECK(nil.value().connections.empty());
+    CHECK_FALSE(mihomo::ParseConnections(json::object()));
+    CHECK_FALSE(mihomo::ParseConnections(json::parse(R"({"connections":{}})")));
 }
 
 TEST_CASE("provider JSON parsing") {
@@ -247,10 +260,11 @@ TEST_CASE("provider JSON parsing") {
     auto rules = mihomo::ParseRuleProviders(json::parse(R"({
         "providers": {
             "geosite": {
-                "name": "geosite",
+                "name": "display name",
                 "type": "Rule",
                 "behavior": "domain",
                 "vehicleType": "HTTP",
+                "updatedAt": "2026-11-24T10:28:00+08:00",
                 "ruleCount": 42
             }
         }
@@ -258,6 +272,9 @@ TEST_CASE("provider JSON parsing") {
     REQUIRE(rules);
     REQUIRE(rules.value().providers.size() == 1);
     CHECK(rules.value().providers[0].ruleCount == 42);
+    CHECK(rules.value().providers[0].name == "geosite");
+    CHECK(rules.value().providers[0].updatedAt == "2026-11-24T10:28:00+08:00");
+    CHECK(rules.value().providers[0].CanRefresh());
 }
 
 TEST_CASE("URL path segment encoding") {

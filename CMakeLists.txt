@@ -64,7 +64,7 @@ endif()
 
 add_library(clashyuka_platform STATIC ${CLASHYUKA_PLATFORM_SOURCES})
 target_include_directories(clashyuka_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(clashyuka_platform PUBLIC clashyuka_options)
+target_link_libraries(clashyuka_platform PUBLIC clashyuka_options nlohmann_json::nlohmann_json)
 if(WIN32)
   target_link_libraries(clashyuka_platform PUBLIC advapi32 winhttp wininet)
 endif()
@@ -129,7 +129,18 @@ target_include_directories(clashyuka_process PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(clashyuka_process PUBLIC clashyuka_options Threads::Threads)
 
 # --- Runtime orchestration (settings, runtime config, kernel session) --------
+# Set only for distribution builds with a verified official GitHub repository.
+set(CLASHYUKA_OFFICIAL_RELEASE_REPOSITORY "" CACHE STRING
+    "Official ClashYuka GitHub release repository (owner/repo, empty disables checks)")
+# Stable vX.Y.Z or X.Y.Z release tags. Windows assets use
+# ClashYuka[-<version>]-windows-<x64|arm64|x86>.<zip|msi|exe>.
+if(NOT CLASHYUKA_OFFICIAL_RELEASE_REPOSITORY STREQUAL "" AND
+   NOT CLASHYUKA_OFFICIAL_RELEASE_REPOSITORY MATCHES "^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$")
+  message(FATAL_ERROR "CLASHYUKA_OFFICIAL_RELEASE_REPOSITORY must be GitHub owner/repo")
+endif()
+
 add_library(clashyuka_runtime STATIC
+  src/runtime/app_update.cpp
   src/runtime/settings_store.cpp
   src/runtime/profile_store.cpp
   src/runtime/subscription_service.cpp
@@ -139,6 +150,10 @@ add_library(clashyuka_runtime STATIC
   src/runtime/kernel_release.cpp
   src/runtime/sha256.cpp
   src/runtime/kernel_installer.cpp
+)
+target_compile_definitions(clashyuka_runtime PRIVATE
+  CLASHYUKA_OFFICIAL_RELEASE_REPOSITORY="${CLASHYUKA_OFFICIAL_RELEASE_REPOSITORY}"
+  CLASHYUKA_BUILD_VERSION="${PROJECT_VERSION}"
 )
 target_include_directories(clashyuka_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(clashyuka_runtime
@@ -197,6 +212,7 @@ add_library(clashyuka_app STATIC
   src/ui/pages/overview_page.cpp
   src/ui/pages/proxies_page.cpp
   src/ui/pages/connections_page.cpp
+  src/ui/pages/rules_page.cpp
   src/ui/pages/profiles_page.cpp
   src/ui/pages/logs_page.cpp
   src/ui/pages/settings_page.cpp
@@ -280,7 +296,7 @@ if(CLASHYUKA_BUILD_TESTS)
   )
   add_test(NAME clashyuka_app_tests COMMAND clashyuka_app_tests)
 
-  add_executable(clashyuka_runtime_tests tests/test_runtime.cpp)
+  add_executable(clashyuka_runtime_tests tests/test_runtime.cpp tests/test_app_update.cpp)
   target_link_libraries(clashyuka_runtime_tests PRIVATE
     clashyuka_runtime
     doctest::doctest

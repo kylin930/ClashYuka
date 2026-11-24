@@ -332,6 +332,12 @@ TEST_CASE("bounded HTTPS configures WinHTTP to disallow downgrade redirects") {
     REQUIRE(::WinHttpQueryOption(request.value, WINHTTP_OPTION_REDIRECT_POLICY,
                                 &policy, &size) != FALSE);
     CHECK(policy == WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP);
+
+    REQUIRE(platform::detail::ConfigureBoundedHttpsRequest(request.value, false));
+    size = sizeof(policy);
+    REQUIRE(::WinHttpQueryOption(request.value, WINHTTP_OPTION_REDIRECT_POLICY,
+                                &policy, &size) != FALSE);
+    CHECK(policy == WINHTTP_OPTION_REDIRECT_POLICY_NEVER);
 }
 
 TEST_CASE("bounded HTTPS rejects plaintext and redacts URL details") {

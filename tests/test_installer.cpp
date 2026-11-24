@@ -10,6 +10,7 @@
 
 #include <nlohmann/json.hpp>
 #include <wx/ffile.h>
+#include <wx/utils.h>
 #include <wx/wfstream.h>
 #include <wx/zipstrm.h>
 #include <wx/zstream.h>
@@ -132,15 +133,31 @@ struct FakeExtractor final : KernelArchiveExtractor {
     }
 };
 
-void WriteZip(const fs::path& path, const std::vector<std::pair<std::string, std::string>>& entries) {
+using ZipEntries = std::vector<std::pair<std::string, std::string>>;
+
+#ifdef _WIN32
+constexpr char kLegacyZipExecutable[] = "mihomo.exe";
+// Synthetic entry matching the v1.19.34 Windows amd64 v1 release naming.
+constexpr char kVersionedZipExecutable[] = "mihomo-windows-amd64-v1-v1.19.34.exe";
+constexpr char kCompatibleZipExecutable[] = "mihomo-windows-amd64-compatible.exe";
+#else
+constexpr char kLegacyZipExecutable[] = "mihomo";
+#endif
+
+void WriteZip(const fs::path& path, const ZipEntries& entries, int level = -1) {
     wxFFileOutputStream file(path.wstring());
     REQUIRE(file.IsOk());
-    wxZipOutputStream zip(file);
+    wxZipOutputStream zip(file, level);
     for (const auto& entry : entries) {
-        REQUIRE(zip.PutNextEntry(entry.first));
+        REQUIRE(zip.PutNextEntry(entry.first, wxDateTime::Now(), entry.second.size()));
         zip.Write(entry.second.data(), entry.second.size());
     }
     REQUIRE(zip.Close());
+}
+
+void WriteBytes(const fs::path& path, const std::string& bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    REQUIRE(output.write(bytes.data(), static_cast<std::streamsize>(bytes.size())).good());
 }
 
 void WriteGzip(const fs::path& path, const std::string& content) {
@@ -330,15 +347,56 @@ TEST_CASE("cancelled downloads leave no installed kernel") {
 TEST_CASE("real ZIP extraction writes only the executable") {
     TempDir dir;
     const fs::path zip = dir.path / "kernel.zip";
-    WriteZip(zip, {{"folder/mihomo.exe", "zip-executable"}, {"readme.txt", "ignored"}});
+    std::string name = kLegacyZipExecutable;
+#ifdef _WIN32
+    SUBCASE("legacy basename") { name = "MIHOMO.EXE"; }
+    SUBCASE("versioned release basename") { name = kVersionedZipExecutable; }
+#endif
+    const std::string payload(128 * 1024, 'x');
+    WriteZip(zip, {{"folder/" + name, payload}, {"readme.txt", "ignored"}});
     const fs::path destination = dir.path / "mihomo.exe";
 
     auto extractor = app::CreateWxArchiveExtractor();
     auto result = extractor->ExtractExecutable(ToUtf8(zip), ToUtf8(destination));
     INFO(result.error().message);
     REQUIRE(result.ok());
-    CHECK(ReadFile(destination) == "zip-executable");
+    CHECK(ReadFile(destination) == std::string(128 * 1024, 'x'));
 }
+
+#ifdef _WIN32
+TEST_CASE("Windows compatible release ZIP accepts the unversioned member") {
+    TempDir dir;
+    const auto archive = dir.path / "mihomo-windows-amd64-compatible-v1.19.34.zip";
+    const auto destination = dir.path / "extracted.bin";
+    const std::string payload(128 * 1024, 'x');
+    WriteZip(archive, {{kCompatibleZipExecutable, payload}});
+
+    auto extractor = app::CreateWxArchiveExtractor();
+    const auto result = extractor->ExtractExecutable(ToUtf8(archive), ToUtf8(destination));
+    INFO(result.error().message);
+    REQUIRE(result.ok());
+    CHECK(ReadFile(destination) == payload);
+}
+
+TEST_CASE("local Mihomo ZIP extraction matches the independently hashed entry") {
+    wxString archive;
+    if (!wxGetEnv("CLASHYUKA_TEST_MIHOMO_ZIP", &archive)) {
+        return;
+    }
+    wxString expected;
+    REQUIRE(wxGetEnv("CLASHYUKA_TEST_MIHOMO_ENTRY_SHA256", &expected));
+    const auto expectedHash = NormalizeSha256(expected.utf8_string());
+    REQUIRE_FALSE(expectedHash.empty());
+
+    TempDir dir;
+    const auto destination = dir.path / "extracted.bin";
+    auto extractor = app::CreateWxArchiveExtractor();
+    const auto result = extractor->ExtractExecutable(archive.utf8_string(), ToUtf8(destination));
+    INFO(result.error().message);
+    REQUIRE(result.ok());
+    CHECK(Sha256File(ToUtf8(destination)) == expectedHash);
+}
+#endif
 
 TEST_CASE("real GZIP extraction writes the executable") {
     TempDir dir;
@@ -353,21 +411,72 @@ TEST_CASE("real GZIP extraction writes the executable") {
     CHECK(ReadFile(destination) == "gzip-executable");
 }
 
-TEST_CASE("unsafe archive members and corrupt archives are rejected") {
+TEST_CASE("ZIP selection is unique and validates every member") {
     TempDir dir;
-    const fs::path traversal = dir.path / "traversal.zip";
-    WriteZip(traversal, {{"../evil.exe", "evil"}, {"mihomo.exe", "good"}});
     auto extractor = app::CreateWxArchiveExtractor();
     const fs::path destination = dir.path / "out.exe";
-    auto unsafe = extractor->ExtractExecutable(ToUtf8(traversal), ToUtf8(destination));
-    CHECK_FALSE(unsafe.ok());
-    CHECK(unsafe.error().kind == core::ErrorKind::ExtractFailed);
-    CHECK_FALSE(fs::exists(destination));
+
+    for (const auto& [label, entries] : std::vector<std::pair<std::string, ZipEntries>>{
+             {"duplicate executable", {{kLegacyZipExecutable, "first"},
+#ifdef _WIN32
+                                       {kVersionedZipExecutable, "second"}}},
+             {"duplicate with unversioned compatible executable",
+              {{kVersionedZipExecutable, "first"}, {kCompatibleZipExecutable, "second"}}},
+             {"lookalike compatible executable",
+              {{"mihomo-windows-amd64-compatible-debug.exe", "other"}}},
+#else
+                                       {"folder/mihomo", "second"}}},
+#endif
+             {"unsafe entry after executable", {{kLegacyZipExecutable, "good"},
+                                                  {"../evil", "bad"}}},
+             {"no matching executable", {{"not-mihomo.exe", "other"}}}}) {
+        CAPTURE(label);
+        const auto archive = dir.path / (label + ".zip");
+        WriteZip(archive, entries);
+
+        auto result = extractor->ExtractExecutable(ToUtf8(archive), ToUtf8(destination));
+        CHECK_FALSE(result.ok());
+        CHECK_FALSE(fs::exists(destination));
+        if (fs::exists(destination)) {
+            fs::remove(destination);
+        }
+    }
 
     const fs::path corrupt = dir.path / "corrupt.zip";
-    { std::ofstream output(corrupt, std::ios::binary); output << "not a zip"; }
-    auto bad = extractor->ExtractExecutable(ToUtf8(corrupt), ToUtf8(destination));
-    CHECK_FALSE(bad.ok());
+    WriteBytes(corrupt, "not a zip");
+    CHECK_FALSE(extractor->ExtractExecutable(ToUtf8(corrupt), ToUtf8(destination)).ok());
+
+    const fs::path truncated = dir.path / "truncated.zip";
+    const fs::path complete = dir.path / "complete.zip";
+    WriteZip(complete, {{kLegacyZipExecutable, "truncated-payload"}});
+    auto archiveBytes = ReadFile(complete);
+    REQUIRE(archiveBytes.size() > 30);
+    archiveBytes.resize(archiveBytes.size() - 30);
+    WriteBytes(truncated, archiveBytes);
+    CHECK_FALSE(extractor->ExtractExecutable(ToUtf8(truncated), ToUtf8(destination)).ok());
+}
+
+TEST_CASE("failed real archive install preserves the previous kernel") {
+    TempDir root;
+    auto transport = std::make_unique<FakeTransport>();
+    auto* transportPtr = transport.get();
+    KernelInstaller installer(std::move(transport), app::CreateWxArchiveExtractor(),
+                              KernelInstallOptions{ToUtf8(root.path), "", false});
+    const auto existing = root.path / "v1.19.33" / "mihomo.exe";
+    fs::create_directories(existing.parent_path());
+    WriteBytes(existing, "previous-kernel");
+
+    KernelAsset asset;
+    asset.name = "mihomo-windows-amd64-compatible-v1.19.34.zip";
+    asset.url = "https://example/compatible.zip";
+    asset.size = 100;
+    asset.digest = "sha256:" + Sha256Hex(transportPtr->payload);
+    std::atomic<bool> cancel{false};
+    const auto result = installer.Install(Release(), asset, cancel);
+    REQUIRE_FALSE(result.ok());
+    CHECK(ReadFile(existing) == "previous-kernel");
+    CHECK(fs::exists(existing));
+    CHECK_FALSE(fs::exists(root.path / "v1.19.34"));
 }
 
 TEST_CASE("installer supports Unicode install paths") {

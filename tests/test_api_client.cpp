@@ -292,6 +292,84 @@ TEST_CASE("Mihomo API client encodes proxy group names and sends the selection b
     CHECK(body.at("name") == "节点 B");
 }
 
+TEST_CASE("Mihomo API closes only a single encoded connection with loopback bearer auth") {
+    std::mutex mutex;
+    std::string target;
+    bool authenticated = false;
+    std::atomic<int> calls{0};
+    MockServer server;
+    server.server().Delete(R"(/connections.*)", [&](const httplib::Request& request,
+                                                     httplib::Response& response) {
+        ++calls;
+        std::lock_guard<std::mutex> lock(mutex);
+        target = request.target;
+        authenticated = HasValidBearer(request);
+        if (!authenticated || request.path == "/connections/gone") {
+            response.status = authenticated ? 404 : 401;
+            response.set_content(kResponseMarker, "text/plain");
+            return;
+        }
+        response.status = 204;
+    });
+    REQUIRE(server.Start());
+    mihomo::MihomoApiConfig config;
+    config.port = server.port();
+    config.secret = kSecret;
+    mihomo::MihomoApiClient client(config);
+    REQUIRE(client.CloseConnection("id space/?#%+"));
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        CHECK(authenticated);
+        CHECK(target == "/connections/id%20space%2F%3F%23%25%2B");
+    }
+    const auto gone = client.CloseConnection("gone");
+    REQUIRE_FALSE(gone);
+    CHECK(gone.error().httpStatus == 404);
+    CHECK(gone.error().message.find(kResponseMarker) == std::string::npos);
+    CHECK_FALSE(client.CloseConnection(""));
+    CHECK_FALSE(client.CloseConnection(".."));
+    CHECK_FALSE(client.CloseConnection("prefix/.."));
+    CHECK_FALSE(client.CloseConnection("/"));
+    config.secret.clear();
+    CHECK_FALSE(mihomo::MihomoApiClient(config).CloseConnection("id"));
+    config.secret = kSecret;
+    config.host = "192.0.2.1";
+    const auto remote = mihomo::MihomoApiClient(config).CloseConnection("id");
+    REQUIRE_FALSE(remote);
+    CHECK(remote.error().kind == core::ErrorKind::InvalidConfig);
+    CHECK(calls.load() == 2);
+}
+
+TEST_CASE("Mihomo rule provider update sends an authenticated PUT to the encoded name") {
+    std::mutex mutex;
+    std::string target;
+    bool authenticated = false;
+    MockServer server;
+    server.server().Put(R"(/providers/rules/.*)", [&](const httplib::Request& request,
+                                                      httplib::Response& response) {
+        std::lock_guard<std::mutex> lock(mutex);
+        target = request.target;
+        authenticated = HasValidBearer(request);
+        response.status = !authenticated ? 401 : request.path == "/providers/rules/missing" ? 404 : 204;
+    });
+    REQUIRE(server.Start());
+    mihomo::MihomoApiConfig config;
+    config.port = server.port();
+    config.secret = kSecret;
+    mihomo::MihomoApiClient client(config);
+    REQUIRE(client.UpdateRuleProvider("\xE6\xB8\xAC test/one?#%"));
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        CHECK(authenticated);
+        CHECK(target == "/providers/rules/%E6%B8%AC%20test%2Fone%3F%23%25");
+    }
+    const auto missing = client.UpdateRuleProvider("missing");
+    REQUIRE_FALSE(missing);
+    CHECK(missing.error().httpStatus == 404);
+    CHECK_FALSE(client.UpdateRuleProvider(""));
+    CHECK_FALSE(client.UpdateRuleProvider("name/.."));
+}
+
 TEST_CASE("Mihomo API client maps authentication and HTTP errors") {
     ApiFixture fixture;
     REQUIRE(fixture.Start());

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include "clashyuka/core/result.h"
 
@@ -29,7 +31,24 @@ struct AppSettings {
 
     // Apply the OS HTTP/HTTPS proxy while the kernel is running.
     bool enableSystemProxy = false;
+
+    bool closeToTray = false;
+    // Empty disables the global window shortcut.
+    std::string windowHotkey;
 };
+
+struct WindowHotkey {
+    bool ctrl = false;
+    bool alt = false;
+    bool shift = false;
+    bool win = false;
+    char key = 0;
+
+    std::string ToString() const;
+};
+
+// Empty input is a valid disabled shortcut. Invalid combinations return nullopt.
+std::optional<WindowHotkey> ParseWindowHotkey(std::string_view text);
 
 struct SettingsLoadResult {
     AppSettings settings;

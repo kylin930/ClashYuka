@@ -30,6 +30,7 @@ core::Result<HttpTextResponse> HttpGetText(const std::string& url, const HttpHea
 struct HttpsTextLimits {
     std::size_t maxBytes = 4 * 1024 * 1024;
     std::chrono::milliseconds timeout{30000};  // Whole request, including redirects.
+    bool followRedirects = true;
 };
 
 bool HttpsTextAvailable() noexcept;

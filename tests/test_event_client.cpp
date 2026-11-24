@@ -82,6 +82,8 @@ TEST_CASE("WebSocket logs channel parses entries and passes the level parameter"
     server.server().WebSocket(
         "/logs", [&](const httplib::Request& request, httplib::ws::WebSocket& socket) {
             levelSeen = request.target.find("level=warning") != std::string::npos;
+            socket.send(R"({"type":"warning","payload":false})");
+            socket.send(R"({"type":"warning","payload":")" + std::string(65536, 'x') + "\"}");
             socket.send(R"({"type":"warning","payload":"hello"})");
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             socket.close();
@@ -102,6 +104,7 @@ TEST_CASE("WebSocket logs channel parses entries and passes the level parameter"
     CHECK(WaitUntil([&] { return messages.load() >= 1; }));
     CHECK(levelSeen.load());
     client.Disconnect();
+    CHECK(messages.load() == 1);
 }
 
 TEST_CASE("WebSocket malformed messages are ignored without killing the channel") {
@@ -149,6 +152,37 @@ TEST_CASE("WebSocket reconnects after the server closes the connection") {
 
     CHECK(WaitUntil([&] { return messages.load() >= 3; }, 6000));
     CHECK(connections.load() >= 2);
+    client.Disconnect();
+}
+
+TEST_CASE("WebSocket connections deliver an empty snapshot after reconnecting") {
+    std::atomic<int> sessions{0};
+    std::atomic<int> errors{0};
+    std::atomic<bool> populated{false};
+    std::atomic<bool> recovered{false};
+    MockServer server;
+    server.server().WebSocket(
+        "/connections", [&](const httplib::Request&, httplib::ws::WebSocket& socket) {
+            if (++sessions == 1) {
+                socket.send(R"({"connections":[{"id":"first","rule":"MATCH"}],"uploadTotal":12})");
+            } else {
+                socket.send(R"({"connections":null})");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            socket.close();
+        });
+    REQUIRE(server.Start());
+    mihomo::MihomoEventClient client(MakeConfig(server.port(), true));
+    REQUIRE(client.ConnectConnections([&](const mihomo::ConnectionsSnapshot& snapshot) {
+        if (snapshot.connections.empty()) {
+            recovered = errors.load() > 0;
+        } else {
+            populated = snapshot.connections.front().id == "first" &&
+                        snapshot.connections.front().rule == "MATCH" && snapshot.uploadTotal == 12;
+        }
+    }, 1000, [&](const core::Error&) { ++errors; }));
+    CHECK(WaitUntil([&] { return recovered.load(); }));
+    CHECK(populated.load());
     client.Disconnect();
 }
 

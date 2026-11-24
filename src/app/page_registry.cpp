@@ -5,6 +5,7 @@
 #include "clashyuka/ui/pages/overview_page.h"
 #include "clashyuka/ui/pages/profiles_page.h"
 #include "clashyuka/ui/pages/proxies_page.h"
+#include "clashyuka/ui/pages/rules_page.h"
 #include "clashyuka/ui/pages/settings_page.h"
 
 namespace clashyuka::app {
@@ -23,6 +24,8 @@ const std::vector<PageDescriptor>& Descriptors() {
          &CreatePage<ui::ProxiesPage>},
         {PageId::Connections, "Connections", "Live connections from Mihomo",
          ui::IconId::Activity, &CreatePage<ui::ConnectionsPage>},
+        {PageId::Rules, "Rules", "Active routing rules and rule providers", ui::IconId::Check,
+         &CreatePage<ui::RulesPage>},
         {PageId::Profiles, "Profiles", "Configuration files and subscriptions",
          ui::IconId::Home, &CreatePage<ui::ProfilesPage>},
         {PageId::Logs, "Logs", "Kernel and connection logs", ui::IconId::Menu,
@@ -66,6 +69,8 @@ const char* PageIdName(PageId id) {
             return "proxies";
         case PageId::Connections:
             return "connections";
+        case PageId::Rules:
+            return "rules";
         case PageId::Profiles:
             return "profiles";
         case PageId::Logs:

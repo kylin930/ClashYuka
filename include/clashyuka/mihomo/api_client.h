@@ -58,8 +58,10 @@ public:
     core::Result<void> PatchConfigs(const nlohmann::json& patch) const;
     core::Result<RuleCollection> GetRules() const;
     core::Result<ConnectionsSnapshot> GetConnections() const;
+    core::Result<void> CloseConnection(std::string_view id) const;
     core::Result<ProxyProviderCollection> GetProxyProviders() const;
     core::Result<RuleProviderCollection> GetRuleProviders() const;
+    core::Result<void> UpdateRuleProvider(std::string_view name) const;
 
 private:
     struct Impl;

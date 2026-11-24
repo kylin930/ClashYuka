@@ -1,20 +1,13 @@
 #pragma once
 
-#include <vector>
-
-#include <wx/string.h>
-
 #include "clashyuka/ui/pages/page_base.h"
 
-class wxSizer;
+class wxStaticText;
+class wxTextCtrl;
 
 namespace clashyuka::ui {
 
 class Button;
-class SearchField;
-class SurfaceCard;
-class Switch;
-class TextBlock;
 
 class LogsPage final : public PageBase {
 public:
@@ -24,30 +17,17 @@ protected:
     void ApplyState(const app::AppStateSnapshot& state) override;
 
 private:
-    enum class Level { Info, Warn, Error };
-    enum class Filter { All, Info, Warn, Error };
-
-    struct Entry {
-        Level level = Level::Info;
-        wxString text;
-    };
-
     void Rebuild();
-    void UpdateFilters();
     void ScrollToBottom();
 
-    Button* allButton_ = nullptr;
-    Button* infoButton_ = nullptr;
-    Button* warnButton_ = nullptr;
-    Button* errorButton_ = nullptr;
-    SearchField* search_ = nullptr;
-    Switch* autoScroll_ = nullptr;
-    SurfaceCard* logCard_ = nullptr;
-    wxSizer* logSizer_ = nullptr;
-    Filter filter_ = Filter::All;
-    bool autoScrollEnabled_ = true;
+    wxStaticText* status_ = nullptr;
+    wxTextCtrl* output_ = nullptr;
+    Button* clearButton_ = nullptr;
+    wxString level_;
     wxString query_;
-    std::vector<Entry> entries_;
+    bool autoScrollEnabled_ = true;
+    std::shared_ptr<const std::vector<mihomo::MihomoLogEntry>> entries_;
+    wxString renderedText_;
 };
 
 }  // namespace clashyuka::ui

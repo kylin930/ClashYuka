@@ -16,7 +16,8 @@ using core::MakeError;
 
 core::Result<std::string> Request(const MihomoApiConfig& config, const char* method,
                                   const std::string& path, const std::string& body = {},
-                                  const char* content_type = nullptr) {
+                                  const char* content_type = nullptr, bool boundedClose = false,
+                                  int totalTimeoutMs = 0) {
     if (config.host.empty() || IsWildcardAddress(config.host)) {
         return MakeError(ErrorKind::InvalidConfig,
                          "invalid controller host '" + config.host + "'");
@@ -32,6 +33,15 @@ core::Result<std::string> Request(const MihomoApiConfig& config, const char* met
                             static_cast<time_t>(config.readTimeoutMs % 1000) * 1000);
     client.set_write_timeout(static_cast<time_t>(config.readTimeoutMs / 1000),
                              static_cast<time_t>(config.readTimeoutMs % 1000) * 1000);
+
+    if (boundedClose) {
+        client.set_follow_location(false);
+        client.set_max_timeout(5000);
+        client.set_payload_max_length(64 * 1024);
+    }
+    if (totalTimeoutMs > 0) {
+        client.set_max_timeout(totalTimeoutMs);
+    }
 
     httplib::Headers headers;
     if (!config.secret.empty()) {
@@ -104,8 +114,8 @@ core::Result<std::string> Request(const MihomoApiConfig& config, const char* met
 
 core::Result<nlohmann::json> RequestJson(const MihomoApiConfig& config, const char* method,
                                          const std::string& path,
-                                         const std::string& body = {}) {
-    auto response = Request(config, method, path, body);
+                                         const std::string& body = {}, int totalTimeoutMs = 0) {
+    auto response = Request(config, method, path, body, nullptr, false, totalTimeoutMs);
     if (!response) {
         return response.error();
     }
@@ -223,7 +233,7 @@ core::Result<void> MihomoApiClient::PatchConfigs(const nlohmann::json& patch) co
 }
 
 core::Result<RuleCollection> MihomoApiClient::GetRules() const {
-    auto json = RequestJson(impl_->config, "GET", "/rules");
+    auto json = RequestJson(impl_->config, "GET", "/rules", {}, impl_->config.readTimeoutMs);
     if (!json) {
         return json.error();
     }
@@ -238,6 +248,40 @@ core::Result<ConnectionsSnapshot> MihomoApiClient::GetConnections() const {
     return ParseConnections(json.value());
 }
 
+core::Result<void> MihomoApiClient::CloseConnection(std::string_view id) const {
+    auto config = impl_->config;
+    if (!IsLoopbackHost(config.host) || config.secret.empty()) {
+        return MakeError(ErrorKind::InvalidConfig,
+                         "closing a connection requires an authenticated loopback controller");
+    }
+    // Resolve the accepted loopback aliases locally without consulting DNS.
+    if (config.host == "[::1]") {
+        config.host = "::1";
+    } else if (config.host != "::1") {
+        config.host = "127.0.0.1";
+    }
+    // Reject IDs that could normalize to a different route after decoding.
+    if (id.empty() || id.find_first_not_of('/') == std::string_view::npos) {
+        return MakeError(ErrorKind::InvalidConfig, "invalid connection ID");
+    }
+    for (auto rest = id; !rest.empty();) {
+        const auto separator = rest.find('/');
+        const auto segment = rest.substr(0, separator);
+        if (segment == "." || segment == "..") {
+            return MakeError(ErrorKind::InvalidConfig, "invalid connection ID");
+        }
+        if (separator == std::string_view::npos) {
+            break;
+        }
+        rest.remove_prefix(separator + 1);
+    }
+    auto response = Request(config, "DELETE", "/connections/" + EncodePathSegment(id), {}, nullptr, true);
+    if (!response) {
+        return response.error();
+    }
+    return {};
+}
+
 core::Result<ProxyProviderCollection> MihomoApiClient::GetProxyProviders() const {
     auto json = RequestJson(impl_->config, "GET", "/providers/proxies");
     if (!json) {
@@ -247,11 +291,35 @@ core::Result<ProxyProviderCollection> MihomoApiClient::GetProxyProviders() const
 }
 
 core::Result<RuleProviderCollection> MihomoApiClient::GetRuleProviders() const {
-    auto json = RequestJson(impl_->config, "GET", "/providers/rules");
+    auto json = RequestJson(impl_->config, "GET", "/providers/rules", {}, impl_->config.readTimeoutMs);
     if (!json) {
         return json.error();
     }
     return ParseRuleProviders(json.value());
+}
+
+core::Result<void> MihomoApiClient::UpdateRuleProvider(std::string_view name) const {
+    if (name.empty() || name.find('\0') != std::string_view::npos ||
+        name.find_first_not_of('/') == std::string_view::npos) {
+        return MakeError(ErrorKind::InvalidConfig, "invalid rule provider name");
+    }
+    for (auto rest = name; !rest.empty();) {
+        const auto separator = rest.find('/');
+        const auto segment = rest.substr(0, separator);
+        if (segment == "." || segment == "..") {
+            return MakeError(ErrorKind::InvalidConfig, "invalid rule provider name");
+        }
+        if (separator == std::string_view::npos) {
+            break;
+        }
+        rest.remove_prefix(separator + 1);
+    }
+    auto response = Request(impl_->config, "PUT", "/providers/rules/" + EncodePathSegment(name),
+                            {}, nullptr, true, impl_->config.readTimeoutMs);
+    if (!response) {
+        return response.error();
+    }
+    return {};
 }
 
 }  // namespace clashyuka::mihomo

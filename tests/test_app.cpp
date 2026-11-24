@@ -66,6 +66,205 @@ TEST_CASE("app state starts in the disconnected shell state") {
     CHECK(snapshot.connectionCount == 0);
 }
 
+TEST_CASE("live logs cap bursts and retain only the stopped generation until the next start") {
+    AppState state;
+    RecordingObserver observer;
+    state.AddObserver(&observer);
+    runtime::KernelSnapshot kernel;
+    kernel.generation = 1;
+    kernel.phase = runtime::KernelPhase::Running;
+    kernel.logStream.availability = runtime::StreamAvailability::Available;
+    state.UpdateLiveStreams(kernel);
+
+    std::vector<mihomo::MihomoLogEntry> batch;
+    for (int i = 0; i < 505; ++i) {
+        batch.push_back({"info", std::to_string(i)});
+    }
+    const int calls = observer.calls;
+    state.AppendLogs(1, batch);
+    REQUIRE(state.Get().live.logs);
+    CHECK(observer.calls == calls + 1);
+    CHECK(state.Get().live.logs->size() == 500);
+    CHECK(state.Get().live.logs->front().payload == "5");
+    state.AppendLogs(1, {{"info", "latest"}});
+    CHECK(state.Get().live.logs->front().payload == "6");
+    CHECK(state.Get().live.logs->back().payload == "latest");
+    state.ClearLogs();
+    CHECK_FALSE(state.Get().live.logs);
+    CHECK(state.Get().live.logsStatus == runtime::StreamAvailability::Available);
+    state.AppendLogs(1, {{"info", "after clear"}});
+
+    kernel.phase = runtime::KernelPhase::Stopped;
+    state.UpdateLiveStreams(kernel);
+    state.AppendLogs(1, {{"error", "late"}});
+    REQUIRE(state.Get().live.logs);
+    CHECK(state.Get().live.logs->size() == 1);
+    CHECK(state.Get().live.logs->back().payload == "after clear");
+    kernel.generation = 2;
+    kernel.phase = runtime::KernelPhase::Starting;
+    state.UpdateLiveStreams(kernel);
+    CHECK_FALSE(state.Get().live.logs);
+    kernel.phase = runtime::KernelPhase::Running;
+    state.UpdateLiveStreams(kernel);
+    state.AppendLogs(1, {{"error", "previous generation"}});
+    CHECK_FALSE(state.Get().live.logs);
+}
+
+TEST_CASE("live data scrubs secrets and remembers edited subscription URLs") {
+    AppState state;
+    runtime::KernelSnapshot kernel;
+    kernel.phase = runtime::KernelPhase::Running;
+    kernel.generation = 1;
+    kernel.connectionStream.availability = runtime::StreamAvailability::Available;
+    state.UpdateLiveStreams(kernel);
+    const std::string oldUrl = "https://example.test/sub?token=old";
+    const std::string newUrl = "https://example.test/sub?token=new";
+    CHECK(state.RememberRedaction("controller-secret"));
+    CHECK(state.RememberRedaction(oldUrl));
+    state.AppendLogs(1, {{"controller-secret", "before " + oldUrl}, {"warn", newUrl},
+                        {"info", std::string(4090, 'x') + newUrl}});
+    CHECK(state.RememberRedaction(newUrl));
+    CHECK_FALSE(state.RememberRedaction(newUrl));
+    REQUIRE(state.Get().live.logs);
+    REQUIRE(state.Get().live.logs->size() == 2);
+    CHECK(state.Get().live.logs->front().type == "[redacted]");
+    CHECK(state.Get().live.logs->front().payload == "before [redacted]");
+    CHECK(state.Get().live.logs->back().payload == "[redacted]");
+    state.AppendLogs(1, {{"info", oldUrl + " " + newUrl},
+                        {"info", std::string(4090, 'a') + "controller-secret"}});
+    CHECK((*state.Get().live.logs)[2].payload == "[redacted] [redacted]");
+    CHECK(state.Get().live.logs->back().payload.size() <= 4096);
+    CHECK(state.Get().live.logs->back().payload.find("control") == std::string::npos);
+
+    mihomo::ConnectionsSnapshot connections;
+    connections.connections.emplace_back();
+    connections.connections.back().id = "connection-id";
+    connections.connections.back().metadata.host = newUrl;
+    connections.connections.back().chains = {"controller-secret", oldUrl};
+    state.PublishConnections(1, connections);
+    REQUIRE(state.Get().live.connections);
+    const auto& row = state.Get().live.connections->connections.front();
+    CHECK(row.id == "connection-id");
+    CHECK(row.metadata.host == "[redacted]");
+    CHECK(row.chains == std::vector<std::string>{"[redacted]", "[redacted]"});
+}
+
+TEST_CASE("live connection snapshots and close results are scoped to current requests") {
+    AppState state;
+    runtime::KernelSnapshot kernel;
+    kernel.phase = runtime::KernelPhase::Running;
+    kernel.generation = 1;
+    kernel.connectionStream.availability = runtime::StreamAvailability::Available;
+    state.UpdateLiveStreams(kernel);
+    mihomo::ConnectionsSnapshot rows;
+    rows.connections.emplace_back().id = "id";
+    state.PublishConnections(1, rows);
+    CHECK(state.Get().connectionCount == 1);
+    CHECK(state.Get().live.CanClose(1, "id"));
+    CHECK_FALSE(state.Get().live.CanClose(1, "absent"));
+    CHECK_FALSE(state.Get().live.CanClose(2, "id"));
+    CHECK(state.BeginConnectionClose({10, 1, "id"}));
+    CHECK_FALSE(state.BeginConnectionClose({11, 1, "id"}));
+    CHECK_FALSE(state.FinishConnectionClose({11, 1, "id", {}}));
+    CHECK_FALSE(state.FinishConnectionClose({10, 1, "other", {}}));
+    const auto beforeClose = state.Get().live.connections;
+    CHECK(state.FinishConnectionClose({10, 1, "id", {}}));
+    CHECK_FALSE(state.FinishConnectionClose({10, 1, "id", {}}));
+    CHECK_FALSE(state.BeginConnectionClose({11, 1, "id"}));
+    CHECK(state.Get().live.connections == beforeClose);
+    CHECK(state.Get().connectionCount == 1);
+
+    kernel.profileSwitchInProgress = true;
+    state.UpdateLiveStreams(kernel);
+    CHECK_FALSE(state.Get().live.CanClose(1, "id"));
+    kernel.profileSwitchInProgress = false;
+    kernel.connectionStream.availability = runtime::StreamAvailability::Disconnected;
+    state.UpdateLiveStreams(kernel);
+    CHECK_FALSE(state.Get().live.CanClose(1, "id"));
+    kernel.connectionStream.availability = runtime::StreamAvailability::Available;
+    state.UpdateLiveStreams(kernel);
+    CHECK_FALSE(state.Get().live.CanClose(1, "id"));
+    state.PublishConnections(1, {});
+    REQUIRE(state.Get().live.connections);
+    CHECK(state.Get().connectionCount == 0);
+    CHECK_FALSE(state.Get().live.CanClose(1, "id"));
+    state.PublishConnections(1, rows);
+    CHECK(state.BeginConnectionClose({12, 1, "id"}));
+
+    kernel.phase = runtime::KernelPhase::Stopping;
+    state.UpdateLiveStreams(kernel);
+    state.PublishConnections(1, rows);
+    CHECK(state.Get().connectionCount == 0);
+    CHECK_FALSE(state.Get().live.connections);
+    kernel.generation = 2;
+    kernel.phase = runtime::KernelPhase::Running;
+    state.UpdateLiveStreams(kernel);
+    state.PublishConnections(1, rows);
+    CHECK_FALSE(state.Get().live.connections);
+    state.PublishConnections(2, rows);
+    CHECK(state.BeginConnectionClose({13, 2, "id"}));
+    CHECK_FALSE(state.FinishConnectionClose({12, 1, "id", {}}));
+    REQUIRE(state.Get().live.pendingClose);
+    CHECK(state.Get().live.pendingClose->requestId == 13);
+    CHECK(state.FinishConnectionClose({13, 2, "id", core::MakeError(core::ErrorKind::ConnectionFailed,
+                                                                  "untrusted response body")}));
+    CHECK(state.Get().live.CanClose(2, "id"));
+    CHECK(state.Get().connectionCount == 1);
+}
+
+TEST_CASE("connection availability is independent and replaces only with current valid snapshots") {
+    AppState state;
+    runtime::KernelSnapshot kernel;
+    kernel.phase = runtime::KernelPhase::Running;
+    kernel.generation = 3;
+    kernel.connectionStream.availability = runtime::StreamAvailability::Available;
+    kernel.logStream.availability = runtime::StreamAvailability::Disconnected;
+    state.UpdateLiveStreams(kernel);
+
+    mihomo::ConnectionsSnapshot rows;
+    rows.connections.emplace_back().id = "stable-id";
+    rows.connections.front().upload = 7;
+    state.PublishConnections(3, rows);
+    const auto first = state.Get().live.connections;
+    REQUIRE(first);
+    rows.connections.front().upload = 9;
+    kernel.connectionStream.availability = runtime::StreamAvailability::Disconnected;
+    kernel.logStream.availability = runtime::StreamAvailability::Available;
+    state.UpdateLiveStreams(kernel);
+    state.PublishConnections(3, rows);
+    CHECK(state.Get().live.connections == first);
+    CHECK_FALSE(state.Get().live.connectionsFresh);
+    CHECK(state.Get().live.logsStatus == runtime::StreamAvailability::Available);
+
+    kernel.connectionStream.availability = runtime::StreamAvailability::Available;
+    state.UpdateLiveStreams(kernel);
+    state.PublishConnections(2, {});
+    CHECK(state.Get().live.connections == first);
+    state.PublishConnections(3, rows);
+    REQUIRE(state.Get().live.connections != first);
+    CHECK(state.Get().live.connections->connections.front().id == "stable-id");
+    CHECK(state.Get().live.connections->connections.front().upload == 9);
+    CHECK(first->connections.front().upload == 7);
+}
+
+TEST_CASE("system proxy retry is unavailable after an ordinary enable failure") {
+    AppState state;
+    state.SetSystemProxy(true, false, "", "Failure: enable failed", false);
+    CHECK_FALSE(state.Get().systemProxyRetryAvailable);
+}
+
+TEST_CASE("system proxy recovery failure remains visible when preference is disabled") {
+    AppState state;
+    state.SetSystemProxy(false, false, "", "Recovery pending or failure", true);
+    CHECK_FALSE(state.Get().systemProxyEnabled);
+    CHECK_FALSE(state.Get().systemProxyActive);
+    CHECK(state.Get().systemProxyAddress.empty());
+    CHECK(state.Get().systemProxyStatus == "Recovery pending or failure");
+    CHECK(state.Get().systemProxyRetryAvailable);
+    state.SetSystemProxy(false, false, "", "Off", false);
+    CHECK_FALSE(state.Get().systemProxyRetryAvailable);
+}
+
 TEST_CASE("app state notifies observers and skips unchanged values") {
     AppState state;
     RecordingObserver observer;
@@ -224,12 +423,33 @@ TEST_CASE("controller forwards shell messages") {
     CHECK(shell.lastBody.Contains("No action was performed"));
 }
 
+TEST_CASE("rules state distinguishes an empty response from unavailable data") {
+    AppState state;
+    RecordingObserver observer;
+    state.AddObserver(&observer);
+    CHECK_FALSE(state.Get().rulesAvailable);
+    runtime::RulesSnapshot ready;
+    ready.rules = std::make_shared<const mihomo::RuleCollection>();
+    ready.rulesStatus = runtime::RulesLoadStatus::Ready;
+    ready.providersStatus = runtime::RulesLoadStatus::Failed;
+    state.SetRules(true, ready);
+    REQUIRE(observer.last.rules.rules);
+    CHECK(observer.last.rules.rules->empty());
+    CHECK(observer.last.rules.providersStatus == runtime::RulesLoadStatus::Failed);
+    const int calls = observer.calls;
+    state.SetRules(true, ready);
+    CHECK(observer.calls == calls);
+    state.SetRules(false, ready);
+    CHECK_FALSE(observer.last.rulesAvailable);
+    CHECK(observer.last.rules == runtime::RulesSnapshot{});
+}
+
 TEST_CASE("page registry exposes the shell pages in navigation order") {
     const auto& pages = PageRegistry::All();
-    REQUIRE(pages.size() == 6);
+    REQUIRE(pages.size() == 7);
 
     const PageId expected[] = {PageId::Overview, PageId::Proxies, PageId::Connections,
-                               PageId::Profiles, PageId::Logs, PageId::Settings};
+                               PageId::Rules, PageId::Profiles, PageId::Logs, PageId::Settings};
     for (std::size_t i = 0; i < pages.size(); ++i) {
         CHECK(pages[i].id == expected[i]);
         CHECK(PageRegistry::IndexOf(expected[i]) == static_cast<int>(i));
@@ -239,7 +459,9 @@ TEST_CASE("page registry exposes the shell pages in navigation order") {
     }
 
     CHECK(PageRegistry::Get(PageId::Settings).title == "Settings");
-    CHECK(PageRegistry::IndexOf(PageId::Settings) == 5);
+    CHECK(PageRegistry::IndexOf(PageId::Settings) == 6);
+    CHECK(PageRegistry::Get(PageId::Rules).title == "Rules");
+    CHECK(std::string(PageIdName(PageId::Rules)) == "rules");
     CHECK(std::string(PageIdName(PageId::Proxies)) == "proxies");
     CHECK(std::string(PageIdName(PageId::Settings)) == "settings");
 }

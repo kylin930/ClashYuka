@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include "clashyuka/runtime/kernel_session.h"
@@ -94,6 +95,8 @@ TEST_CASE("settings are created with defaults on first run") {
     CHECK(first.settings.mixedPort == 7897);
     CHECK(first.settings.secret.size() == 32);
     CHECK_FALSE(first.settings.autoStartKernel);
+    CHECK_FALSE(first.settings.closeToTray);
+    CHECK(first.settings.windowHotkey.empty());
     CHECK(fs::exists(FromUtf8(path)));
 
     const runtime::SettingsLoadResult second = runtime::LoadSettings(path);
@@ -124,6 +127,61 @@ TEST_CASE("settings round trip through JSON") {
     CHECK(loaded.settings.autoStartKernel);
     CHECK(loaded.settings.enableSystemProxy);
     CHECK(loaded.settings.secret == settings.secret);
+}
+
+TEST_CASE("desktop settings round trip and invalid shortcuts preserve saved preferences") {
+    TempDir dir;
+    const auto path = ToUtf8(dir.path / "settings.json");
+    auto settings = runtime::DefaultSettings();
+    settings.closeToTray = true;
+    settings.windowHotkey = "Ctrl+Alt+Y";
+    REQUIRE(runtime::SaveSettings(path, settings).ok());
+    settings.closeToTray = false;
+    settings.windowHotkey = "Ctrl+Ctrl+Y";
+    CHECK_FALSE(runtime::SaveSettings(path, settings).ok());
+    const auto loaded = runtime::LoadSettings(path);
+    CHECK(loaded.warning.empty());
+    CHECK(loaded.settings.closeToTray);
+    CHECK(loaded.settings.windowHotkey == "Ctrl+Alt+Y");
+}
+
+TEST_CASE("older desktop settings default off and malformed fields do not reset other settings") {
+    TempDir dir;
+    const auto file = dir.path / "settings.json";
+    const auto path = ToUtf8(file);
+    auto settings = runtime::DefaultSettings();
+    settings.controllerPort = 19001;
+    REQUIRE(runtime::SaveSettings(path, settings).ok());
+    auto root = nlohmann::json::parse(ReadFile(file));
+    root.erase("closeToTray");
+    root.erase("windowHotkey");
+    WriteFile(file, root.dump());
+    const auto legacy = runtime::LoadSettings(path);
+    CHECK(legacy.warning.empty());
+    CHECK_FALSE(legacy.settings.closeToTray);
+    CHECK(legacy.settings.windowHotkey.empty());
+    root["closeToTray"] = "true";
+    root["windowHotkey"] = "Y";
+    WriteFile(file, root.dump());
+    const auto malformed = runtime::LoadSettings(path);
+    CHECK_FALSE(malformed.warning.empty());
+    CHECK_FALSE(malformed.settings.closeToTray);
+    CHECK(malformed.settings.windowHotkey.empty());
+    CHECK(malformed.settings.controllerPort == 19001);
+}
+
+TEST_CASE("shortcut text is normalized and requires a control modifier and a letter or digit") {
+    const auto shortcut = runtime::ParseWindowHotkey(" shift + aLt + ctrl + y ");
+    REQUIRE(shortcut);
+    CHECK(shortcut->ToString() == "Ctrl+Alt+Shift+Y");
+    const auto disabled = runtime::ParseWindowHotkey("  ");
+    REQUIRE(disabled);
+    CHECK(disabled->ToString().empty());
+    CHECK(runtime::ParseWindowHotkey("Win+7").has_value());
+    for (const auto* bad : {"Y", "Shift+Y", "Ctrl++Y", "Ctrl+Y+", "Ctrl+F1", "Alt+?"}) {
+        CAPTURE(bad);
+        CHECK_FALSE(runtime::ParseWindowHotkey(bad));
+    }
 }
 
 TEST_CASE("missing settings fields fall back to defaults") {
@@ -355,6 +413,28 @@ struct FakeKernel {
     std::function<void(int)> exitHandler;
     KernelEventDriver::TrafficHandler trafficHandler;
     KernelEventDriver::ConnectionHandler connectionHandler;
+    KernelEventDriver::LogHandler logHandler;
+    KernelEventDriver::ErrorHandler connectionError;
+    std::atomic<int> closeCalls{0};
+    std::atomic<bool> blockClose{false};
+    std::atomic<bool> failClose{false};
+    std::string lastClosedId;
+    std::vector<std::string> rulesRequests;
+    std::atomic<int> providerUpdates{0};
+    std::atomic<bool> blockProviderUpdate{false};
+    std::atomic<bool> failProviderUpdate{false};
+    std::atomic<bool> failProviderRead{false};
+    std::atomic<int> ruleCount{1};
+
+    void RecordRulesRequest(std::string request) {
+        std::lock_guard<std::mutex> lock(mutex);
+        rulesRequests.push_back(std::move(request));
+    }
+
+    std::vector<std::string> RulesRequests() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return rulesRequests;
+    }
     mihomo::MihomoLaunchOptions lastLaunch;
 
     mihomo::MihomoLaunchOptions LastLaunch() const {
@@ -496,6 +576,45 @@ public:
         return mihomo::MihomoVersion{"v1.19.0-test", true};
     }
 
+    core::Result<void> CloseConnection(std::string_view id) override {
+        {
+            std::lock_guard<std::mutex> lock(fake_->mutex);
+            fake_->lastClosedId = id;
+        }
+        ++fake_->closeCalls;
+        WaitUntil([this] { return !fake_->blockClose.load(); });
+        if (fake_->failClose.load()) {
+            return core::MakeError(core::ErrorKind::HttpStatus, "private response text", 404);
+        }
+        return {};
+    }
+
+    core::Result<mihomo::RuleCollection> GetRules() override {
+        fake_->RecordRulesRequest("rules");
+        return mihomo::RuleCollection(static_cast<std::size_t>(fake_->ruleCount.load()));
+    }
+
+    core::Result<mihomo::RuleProviderCollection> GetRuleProviders() override {
+        fake_->RecordRulesRequest("providers");
+        if (fake_->failProviderRead) {
+            return core::MakeError(core::ErrorKind::ConnectionFailed, "simulated provider read failure");
+        }
+        return mihomo::RuleProviderCollection{{{"remote", "Rule", "domain", "HTTP", "",
+                                                fake_->ruleCount.load()},
+                                               {"inline", "Rule", "domain", "Inline", "", 0}}};
+    }
+
+    core::Result<void> UpdateRuleProvider(std::string_view name) override {
+        fake_->RecordRulesRequest("update " + std::string(name));
+        ++fake_->providerUpdates;
+        WaitUntil([this] { return !fake_->blockProviderUpdate.load(); });
+        if (fake_->failProviderUpdate) {
+            return core::MakeError(core::ErrorKind::HttpStatus, "simulated update failure");
+        }
+        ++fake_->ruleCount;
+        return {};
+    }
+
 private:
     std::shared_ptr<FakeKernel> fake_;
 };
@@ -525,8 +644,14 @@ public:
                                    "simulated connections failure");
         }
         fake_->connectionHandler = std::move(handler);
+        fake_->connectionError = std::move(onError);
         (void)intervalMs;
-        (void)onError;
+        return {};
+    }
+
+    core::Result<void> ConnectLogs(LogHandler handler, ErrorHandler) override {
+        std::lock_guard<std::mutex> lock(fake_->mutex);
+        fake_->logHandler = std::move(handler);
         return {};
     }
 
@@ -535,6 +660,8 @@ public:
         fake_->eventDisconnects.fetch_add(1);
         fake_->trafficHandler = nullptr;
         fake_->connectionHandler = nullptr;
+        fake_->logHandler = nullptr;
+        fake_->connectionError = nullptr;
     }
 
 private:
@@ -568,6 +695,25 @@ struct RecordingObserver final : runtime::KernelSessionObserver {
     std::vector<runtime::KernelSnapshot> snapshots;
     std::vector<std::pair<double, double>> traffic;
     std::vector<int> connections;
+    std::vector<mihomo::ConnectionsSnapshot> connectionFrames;
+    std::vector<std::vector<mihomo::MihomoLogEntry>> logBatches;
+    std::vector<ConnectionCloseResult> closeResults;
+
+    void OnKernelConnections(std::uint64_t generation, const mihomo::ConnectionsSnapshot& snapshot) override {
+        KernelSessionObserver::OnKernelConnections(generation, snapshot);
+        std::lock_guard<std::mutex> lock(mutex);
+        connectionFrames.push_back(snapshot);
+    }
+
+    void OnKernelLogs(std::uint64_t, const std::vector<mihomo::MihomoLogEntry>& batch) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        logBatches.push_back(batch);
+    }
+
+    void OnKernelConnectionClose(const ConnectionCloseResult& result) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        closeResults.push_back(result);
+    }
 
     void OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) override {
         std::lock_guard<std::mutex> lock(mutex);
@@ -621,7 +767,7 @@ struct Harness {
     RecordingObserver observer;
     std::unique_ptr<runtime::KernelSession> session;
 
-    Harness() {
+    explicit Harness(KernelSession::Dispatcher dispatcher = [](std::function<void()> task) { task(); }) {
         runtime::KernelOptions options;
         options.executablePath = MakeFakeExecutable();
         options.workingDirectory = ToUtf8(dir.path);
@@ -634,12 +780,7 @@ struct Harness {
         options.readinessTimeoutMs = 20;
 
         session = std::make_unique<runtime::KernelSession>(
-            std::make_unique<FakeFactory>(fake),
-            [](std::function<void()> task) {
-                if (task) {
-                    task();
-                }
-            });
+            std::make_unique<FakeFactory>(fake), std::move(dispatcher));
         session->SetOptions(options);
         session->SetObserver(&observer);
     }
@@ -678,6 +819,78 @@ void EmitTraffic(const std::shared_ptr<FakeKernel>& fake, double up, double down
 // ---------------------------------------------------------------------------
 // KernelSession
 // ---------------------------------------------------------------------------
+
+TEST_CASE("rule provider refresh re-reads both collections and preserves independently valid data") {
+    using runtime::RuleProviderUpdateStatus;
+    using runtime::RulesLoadStatus;
+    Harness harness;
+    CHECK_FALSE(harness.session->RefreshRules(0));
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(runtime::KernelPhase::Running));
+    const auto generation = harness.observer.Last().generation;
+    REQUIRE(harness.session->RefreshRules(generation));
+    REQUIRE(WaitUntil([&] { return harness.observer.Last().rules.providersStatus == RulesLoadStatus::Ready; }));
+    CHECK_FALSE(harness.session->RefreshRules(generation, "inline"));
+    CHECK_FALSE(harness.session->RefreshRules(generation, "missing"));
+    CHECK_FALSE(harness.session->RefreshRules(generation + 1, "remote"));
+
+    harness.fake->blockProviderUpdate = true;
+    REQUIRE(harness.session->RefreshRules(generation, "remote"));
+    REQUIRE(WaitUntil([&] { return harness.fake->providerUpdates == 1; }));
+    CHECK(harness.observer.Last().rules.loading);
+    CHECK_FALSE(harness.session->RefreshRules(generation, "remote"));
+    harness.fake->blockProviderUpdate = false;
+    REQUIRE(WaitUntil([&] { return harness.observer.Last().rules.updateStatus == RuleProviderUpdateStatus::Updated; }));
+    const auto refreshed = harness.observer.Last().rules;
+    REQUIRE(refreshed.rules);
+    REQUIRE(refreshed.providers);
+    CHECK(refreshed.rules->size() == 2);
+    CHECK(refreshed.providers->providers[0].ruleCount == 2);
+    CHECK(harness.fake->RulesRequests() == std::vector<std::string>{"rules", "providers",
+          "update remote", "rules", "providers"});
+
+    harness.fake->failProviderUpdate = true;
+    REQUIRE(harness.session->RefreshRules(generation, "remote"));
+    REQUIRE(WaitUntil([&] { return harness.observer.Last().rules.updateStatus == RuleProviderUpdateStatus::UpdateFailed; }));
+    CHECK(harness.observer.Last().rules.rules == refreshed.rules);
+    CHECK(harness.observer.Last().rules.providers == refreshed.providers);
+    CHECK(harness.fake->RulesRequests().size() == 6);
+
+    harness.fake->failProviderUpdate = false;
+    harness.fake->failProviderRead = true;
+    REQUIRE(harness.session->RefreshRules(generation, "remote"));
+    REQUIRE(WaitUntil([&] { return harness.observer.Last().rules.updateStatus == RuleProviderUpdateStatus::ReadbackFailed; }));
+    const auto partial = harness.observer.Last().rules;
+    REQUIRE(partial.rules);
+    CHECK(partial.rules->size() == 3);
+    CHECK(partial.rulesStatus == RulesLoadStatus::Ready);
+    CHECK(partial.providers == refreshed.providers);
+    CHECK(partial.providersStatus == RulesLoadStatus::Failed);
+}
+
+TEST_CASE("rule refresh drops an in-flight update when the kernel generation changes") {
+    Harness harness;
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(runtime::KernelPhase::Running));
+    const auto generation = harness.observer.Last().generation;
+    REQUIRE(harness.session->RefreshRules(generation));
+    REQUIRE(WaitUntil([&] { return harness.observer.Last().rules.providers != nullptr; }));
+    harness.fake->blockProviderUpdate = true;
+    REQUIRE(harness.session->RefreshRules(generation, "remote"));
+    REQUIRE(WaitUntil([&] { return harness.fake->providerUpdates == 1; }));
+    harness.session->Restart();
+    CHECK_FALSE(harness.observer.Last().rulesAvailable);
+    CHECK_FALSE(harness.observer.Last().rules.providers);
+    harness.fake->blockProviderUpdate = false;
+    REQUIRE(harness.WaitPhase(runtime::KernelPhase::Running));
+    const auto restarted = harness.observer.Last();
+    CHECK(restarted.generation > generation);
+    CHECK(restarted.rules == runtime::RulesSnapshot{});
+    CHECK(harness.fake->RulesRequests() == std::vector<std::string>{"rules", "providers", "update remote"});
+    CHECK_FALSE(harness.session->RefreshRules(generation));
+    CHECK(harness.session->RefreshRules(restarted.generation));
+    REQUIRE(WaitUntil([&] { return harness.observer.Last().rules.providers != nullptr; }));
+}
 
 TEST_CASE("kernel session starts, reports the version and connects events") {
     Harness harness;
@@ -912,6 +1125,171 @@ TEST_CASE("live traffic and connection counts reach the observer") {
         return !harness.observer.connections.empty() &&
                harness.observer.connections.back() == 3;
     }));
+}
+
+TEST_CASE("connection availability recovers after a valid full snapshot") {
+    Harness harness;
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    CHECK(harness.observer.Last().connectionStream.availability == StreamAvailability::Waiting);
+    const auto emit = harness.fake->CurrentConnectionHandler();
+    emit({});
+    REQUIRE(WaitUntil([&] {
+        std::lock_guard<std::mutex> lock(harness.observer.mutex);
+        return harness.observer.connectionFrames.size() == 1;
+    }));
+    CHECK(harness.observer.Last().connectionStream.availability == StreamAvailability::Available);
+    CHECK(harness.observer.connectionFrames.back().connections.empty());
+    harness.fake->connectionError(core::MakeError(core::ErrorKind::ConnectionFailed, "private error"));
+    CHECK(harness.observer.Last().connectionStream.availability == StreamAvailability::Disconnected);
+    CHECK_FALSE(harness.observer.Last().connectionStream.error.empty());
+    CHECK(harness.observer.Last().logStream.availability == StreamAvailability::Waiting);
+    CHECK(harness.session->Phase() == KernelPhase::Running);
+    CHECK_FALSE(harness.session->CloseConnection(harness.observer.Last().generation, "active"));
+
+    mihomo::ConnectionsSnapshot snapshot;
+    snapshot.downloadTotal = 123;
+    snapshot.connections.push_back({"active"});
+    snapshot.connections.back().metadata.host = "example.test";
+    emit(snapshot);
+    const auto recovered = harness.observer.Last();
+    CHECK(recovered.connectionStream.availability == StreamAvailability::Available);
+    CHECK(recovered.connectionStream.error.empty());
+    CHECK(recovered.eventError.empty());
+    CHECK(harness.observer.connectionFrames.back().downloadTotal == 123);
+    CHECK(harness.observer.connectionFrames.back().connections.front().metadata.host == "example.test");
+}
+
+TEST_CASE("log dispatch batches the newest entries and drops queued batches on restart") {
+    std::mutex dispatchMutex;
+    std::vector<std::function<void()>> pending;
+    const auto drain = [&] {
+        std::vector<std::function<void()>> jobs;
+        {
+            std::lock_guard<std::mutex> lock(dispatchMutex);
+            jobs.swap(pending);
+        }
+        for (auto& job : jobs) {
+            job();
+        }
+    };
+    Harness harness([&](std::function<void()> job) {
+        std::lock_guard<std::mutex> lock(dispatchMutex);
+        pending.push_back(std::move(job));
+    });
+    auto options = harness.Options();
+    options.logRedactions = {"https://example.test/sub?token=hidden"};
+    harness.SetOptions(std::move(options));
+    harness.session->Start();
+    const auto waitRunning = [&](std::uint64_t after) {
+        return WaitUntil([&] {
+            drain();
+            const auto current = harness.observer.Last();
+            return current.phase == KernelPhase::Running && current.generation > after;
+        });
+    };
+    REQUIRE(waitRunning(0));
+    const auto firstGeneration = harness.observer.Last().generation;
+    const auto oldLog = harness.fake->logHandler;
+    REQUIRE(oldLog != nullptr);
+    for (int i = 0; i < 505; ++i) {
+        oldLog({"debug", std::to_string(i) + " test-secret https://example.test/sub?token=hidden "
+                         + std::string(5000, 'x')});
+    }
+    REQUIRE(WaitUntil([&] {
+        drain();
+        return harness.observer.logBatches.size() == 1;
+    }));
+    const auto& batch = harness.observer.logBatches.front();
+    REQUIRE(batch.size() == 500);
+    CHECK(batch.front().payload.starts_with("5 [redacted] [redacted] "));
+    CHECK(batch.back().payload.starts_with("504 [redacted] [redacted] "));
+    CHECK(batch.back().payload.size() == 4096);
+    CHECK(harness.observer.Last().logStream.availability == StreamAvailability::Available);
+
+    auto updated = harness.Options();
+    const std::string newUrl = "https://example.test/" + std::string(4300, 'a') + "?token=edited";
+    oldLog({"info", newUrl});  // Already buffered and truncated before the URL was known.
+    updated.logRedactions.push_back(newUrl);
+    harness.SetOptions(std::move(updated));
+    oldLog({"info", "test-secret " + newUrl + " https://example.test/sub?token=hidden"});
+    REQUIRE(WaitUntil([&] {
+        drain();
+        return harness.observer.logBatches.size() == 2;
+    }));
+    REQUIRE(harness.observer.logBatches.back().size() == 1);
+    CHECK(harness.observer.logBatches.back().front().payload == "[redacted] [redacted] [redacted]");
+
+    oldLog({"info", "queued before restart"});
+    harness.session->Restart();
+    REQUIRE(waitRunning(firstGeneration));
+    oldLog({"info", "late from previous generation"});
+    drain();
+    CHECK(harness.observer.logBatches.size() == 2);
+    harness.fake->logHandler({"info", "new session"});
+    REQUIRE(WaitUntil([&] {
+        drain();
+        return harness.observer.logBatches.size() == 3;
+    }));
+    CHECK(harness.observer.logBatches.back().front().payload == "new session");
+}
+
+TEST_CASE("single connection close is serialized and its result is guarded") {
+    Harness harness;
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    const auto generation = harness.observer.Last().generation;
+    const auto emit = harness.fake->CurrentConnectionHandler();
+    mihomo::ConnectionsSnapshot snapshot;
+    snapshot.connections.push_back({"active"});
+    snapshot.connections.push_back({"second"});
+    emit(snapshot);
+
+    CHECK_FALSE(harness.session->CloseConnection(generation + 1, "active"));
+    CHECK_FALSE(harness.session->CloseConnection(generation, "unknown"));
+    harness.fake->blockClose = true;
+    const auto request = harness.session->CloseConnection(generation, "active");
+    REQUIRE(request);
+    REQUIRE(WaitUntil([&] { return harness.fake->closeCalls.load() == 1; }));
+    CHECK_FALSE(harness.session->CloseConnection(generation, "active"));
+    CHECK_FALSE(harness.session->CloseConnection(generation, "second"));
+    harness.fake->blockClose = false;
+    const auto waitResults = [&](std::size_t count) {
+        return WaitUntil([&] {
+            std::lock_guard<std::mutex> lock(harness.observer.mutex);
+            return harness.observer.closeResults.size() == count;
+        });
+    };
+    REQUIRE(waitResults(1));
+    CHECK(harness.observer.closeResults.front().requestId == *request);
+    CHECK(harness.observer.closeResults.front().generation == generation);
+    CHECK(harness.observer.closeResults.front().connectionId == "active");
+    CHECK_FALSE(harness.observer.closeResults.front().error);
+    {
+        std::lock_guard<std::mutex> lock(harness.fake->mutex);
+        CHECK(harness.fake->lastClosedId == "active");
+    }
+    REQUIRE(harness.observer.connectionFrames.size() == 1);
+    CHECK(harness.observer.connectionFrames.back().connections.size() == 2);
+
+    harness.fake->failClose = true;
+    REQUIRE(harness.session->CloseConnection(generation, "second"));
+    REQUIRE(waitResults(2));
+    CHECK(harness.observer.closeResults.back().error.httpStatus == 404);
+    CHECK(harness.observer.closeResults.back().error.message.find("private") == std::string::npos);
+
+    harness.fake->blockClose = true;
+    REQUIRE(harness.session->CloseConnection(generation, "active"));
+    REQUIRE(WaitUntil([&] { return harness.fake->closeCalls.load() == 3; }));
+    harness.session->Restart();
+    harness.fake->blockClose = false;
+    REQUIRE(WaitUntil([&] {
+        const auto current = harness.observer.Last();
+        return current.phase == KernelPhase::Running && current.generation > generation;
+    }));
+    CHECK(harness.observer.closeResults.size() == 2);
+    emit(snapshot);
+    CHECK_FALSE(harness.session->CloseConnection(harness.observer.Last().generation, "active"));
 }
 
 TEST_CASE("imported copies isolate ingress and preserve group behavior") {

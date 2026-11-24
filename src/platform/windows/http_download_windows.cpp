@@ -408,8 +408,9 @@ private:
 
 }  // namespace
 
-bool detail::ConfigureBoundedHttpsRequest(HINTERNET request) {
-    DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+bool detail::ConfigureBoundedHttpsRequest(HINTERNET request, bool followRedirects) {
+    DWORD policy = followRedirects ? WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP
+                                   : WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     DWORD redirects = kMaxRedirects;
     DWORD disable = WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION;
     return ::WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy)) &&
@@ -458,7 +459,7 @@ core::Result<HttpTextResponse> HttpGetBoundedHttpsText(
     if (!handles.request) {
         return MakeError(ErrorKind::DownloadFailed, "could not open an HTTPS request");
     }
-    if (!detail::ConfigureBoundedHttpsRequest(handles.request)) {
+    if (!detail::ConfigureBoundedHttpsRequest(handles.request, limits.followRedirects)) {
         return MakeError(ErrorKind::DownloadFailed, "could not configure the HTTPS request");
     }
     BoundedRequest pending(handles);

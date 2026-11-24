@@ -3,11 +3,22 @@
 #include <string>
 
 #include <wx/string.h>
+#include <wx/uilocale.h>
 
 #include "clashyuka/app/app_state.h"
 #include "clashyuka/core/result.h"
 
 namespace clashyuka::app {
+
+inline wxString DesktopText(const char* english, const char* chinese) {
+    // The desktop controls follow the primary OS UI language.
+    static const bool useChinese = [] {
+        const auto languages = wxUILocale::GetPreferredUILanguages();
+        return !languages.empty() &&
+               wxLocaleIdent::FromTag(languages.front()).GetLanguage() == "zh";
+    }();
+    return wxString::FromUTF8(useChinese ? chinese : english);
+}
 
 inline wxString KernelStateText(KernelState state) {
     switch (state) {

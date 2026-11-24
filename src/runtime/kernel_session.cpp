@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <iterator>
 #include <string_view>
 #include <utility>
 
@@ -18,6 +19,52 @@ namespace fs = std::filesystem;
 
 constexpr int kShutdownWaitMs = 15000;
 constexpr std::size_t kRecentOutputLimit = 8;
+constexpr std::size_t kPendingLogLimit = 500;
+constexpr std::size_t kLogPayloadBytes = 4096;
+
+std::string SanitizeLogField(std::string_view text, const std::vector<std::string>& redactions,
+                             std::string_view activeSecret, std::size_t maxBytes) {
+    // Match against the original field, including overlapping values, before truncating.
+    std::string clean;
+    std::size_t copied = 0;
+    for (std::size_t pos = 0; pos < text.size() && clean.size() < maxBytes;) {
+        std::size_t start = std::string_view::npos;
+        std::size_t end = 0;
+        const auto consider = [&](std::string_view value) {
+            if (value.empty()) {
+                return;
+            }
+            const auto match = text.find(value, pos);
+            if (match != std::string_view::npos && match <= start) {
+                end = match == start ? std::max(end, match + value.size()) : match + value.size();
+                start = match;
+            }
+        };
+        consider(activeSecret);
+        for (const auto& value : redactions) {
+            consider(value);
+        }
+        if (start == std::string_view::npos) {
+            break;
+        }
+        if (start >= copied) {
+            clean.append(text.substr(copied, std::min(start - copied, maxBytes + 1 - clean.size())));
+            clean += "[redacted]";
+        }
+        copied = std::max(copied, end);
+        pos = start + 1;
+    }
+    if (clean.size() <= maxBytes) {
+        clean.append(text.substr(copied, maxBytes + 1 - clean.size()));
+    }
+    if (clean.size() > maxBytes) {
+        while (maxBytes > 0 && (static_cast<unsigned char>(clean[maxBytes]) & 0xC0) == 0x80) {
+            --maxBytes;
+        }
+        clean.resize(maxBytes);
+    }
+    return clean;
+}
 
 fs::path PathFromUtf8(const std::string& value) {
     return fs::path(std::u8string(value.begin(), value.end()));
@@ -42,7 +89,20 @@ struct KernelSession::SharedState {
     bool generatedConfig = false;
     int mixedPort = 0;
     core::Error error;
-    std::string eventError;
+    StreamStatus trafficStream;
+    StreamStatus connectionStream;
+    StreamStatus logStream;
+    std::shared_ptr<const mihomo::ConnectionsSnapshot> connections;
+    std::optional<mihomo::TrafficStatistics> traffic;
+    std::deque<mihomo::MihomoLogEntry> logs;
+    std::vector<std::string> logRedactions;
+    bool connectionsDirty = false;
+    bool streamStatusDirty = false;
+    bool streamDispatchPending = false;
+    bool acceptingEvents = false;
+    std::uint64_t nextCloseId = 0;
+    std::uint64_t pendingCloseId = 0;
+    RulesSnapshot rules;
     KernelSessionObserver* observer = nullptr;
     mihomo::MihomoApiConfig apiConfig;
     std::string runningProfileId;
@@ -51,7 +111,64 @@ struct KernelSession::SharedState {
     std::uint64_t nextSwitchId = 0;
     std::uint64_t nextPublication = 0;
     std::uint64_t deliveredPublication = 0;
-    bool imported = false;
+
+    bool IsStreaming(std::uint64_t expectedGeneration) const {
+        return generation == expectedGeneration && phase == KernelPhase::Running && acceptingEvents;
+    }
+
+    bool CanAccessRules(std::uint64_t expectedGeneration) const {
+        return IsStreaming(expectedGeneration) && !pendingSwitch;
+    }
+
+    bool HasConnection(const std::string& id) const {
+        return !id.empty() && connections &&
+               std::any_of(connections->connections.begin(), connections->connections.end(),
+                           [&id](const auto& connection) { return connection.id == id; });
+    }
+
+    void ResetStreams() {
+        acceptingEvents = false;
+        trafficStream = {};
+        connectionStream = {};
+        logStream = {};
+        connections.reset();
+        traffic.reset();
+        logs.clear();
+        connectionsDirty = false;
+        streamStatusDirty = false;
+        streamDispatchPending = false;
+        pendingCloseId = 0;
+        rules = {};
+    }
+
+    KernelSnapshot MakeSnapshot() const {
+        KernelSnapshot snapshot;
+        snapshot.phase = phase;
+        snapshot.generation = generation;
+        snapshot.version = version;
+        snapshot.apiAddress = apiAddress;
+        snapshot.configPath = configPath;
+        snapshot.generatedConfig = generatedConfig;
+        snapshot.mixedPort = mixedPort;
+        snapshot.error = error;
+        snapshot.runningProfileId = runningProfileId;
+        snapshot.profileSwitchInProgress = pendingSwitch.has_value();
+        snapshot.profileSwitchResult = switchResult;
+        snapshot.trafficStream = trafficStream;
+        snapshot.connectionStream = connectionStream;
+        snapshot.logStream = logStream;
+        snapshot.rulesAvailable = CanAccessRules(generation);
+        if (snapshot.rulesAvailable) {
+            snapshot.rules = rules;
+        }
+        for (const auto* stream : {&trafficStream, &connectionStream, &logStream}) {
+            if (!stream->error.empty()) {
+                snapshot.eventError = stream->error;
+                break;
+            }
+        }
+        return snapshot;
+    }
 };
 
 struct KernelSession::LaunchConfig {
@@ -102,11 +219,17 @@ void KernelSession::SetObserver(KernelSessionObserver* observer) {
     }
     if (observer != nullptr) {
         Publish();
+        DispatchStreams(state_, dispatcher_, Snapshot().generation);
     }
 }
 
 void KernelSession::SetOptions(KernelOptions options) {
-    std::lock_guard<std::mutex> lock(optionsMutex_);
+    std::scoped_lock lock(optionsMutex_, state_->mutex);
+    if (state_->logRedactions != options.logRedactions) {
+        // Pending frames were already truncated with the old rules.
+        state_->logs.clear();
+        state_->logRedactions = options.logRedactions;
+    }
     options_ = std::move(options);
 }
 
@@ -122,20 +245,7 @@ KernelPhase KernelSession::Phase() const {
 
 KernelSnapshot KernelSession::Snapshot() const {
     std::lock_guard<std::mutex> lock(state_->mutex);
-    KernelSnapshot snapshot;
-    snapshot.phase = state_->phase;
-    snapshot.generation = state_->generation;
-    snapshot.version = state_->version;
-    snapshot.apiAddress = state_->apiAddress;
-    snapshot.configPath = state_->configPath;
-    snapshot.generatedConfig = state_->generatedConfig;
-    snapshot.mixedPort = state_->mixedPort;
-    snapshot.error = state_->error;
-    snapshot.eventError = state_->eventError;
-    snapshot.runningProfileId = state_->runningProfileId;
-    snapshot.profileSwitchInProgress = state_->pendingSwitch.has_value();
-    snapshot.profileSwitchResult = state_->switchResult;
-    return snapshot;
+    return state_->MakeSnapshot();
 }
 
 mihomo::MihomoApiConfig KernelSession::ApiConfig() const {
@@ -160,7 +270,7 @@ void KernelSession::Start() {
         state_->phase = KernelPhase::Starting;
         state_->version.clear();
         state_->error = {};
-        state_->eventError.clear();
+        state_->ResetStreams();
         state_->configPath.clear();
         state_->generatedConfig = false;
         cancelRequested_.store(false);
@@ -211,7 +321,7 @@ void KernelSession::Restart() {
             state_->phase = KernelPhase::Starting;
             state_->version.clear();
             state_->error = {};
-            state_->eventError.clear();
+            state_->ResetStreams();
             state_->configPath.clear();
             state_->generatedConfig = false;
         }
@@ -239,6 +349,7 @@ std::optional<std::uint64_t> KernelSession::SwitchProfile(KernelProfile profile)
         command.profileSwitch.oldProfileId = state_->runningProfileId;
         command.profileSwitch.newProfileId = command.options.profile.id;
         state_->pendingSwitch = command.profileSwitch;
+        state_->rules = {};
         queue_.push_back(std::move(command));
     }
     Publish();
@@ -246,11 +357,64 @@ std::optional<std::uint64_t> KernelSession::SwitchProfile(KernelProfile profile)
     return requestId;
 }
 
+std::optional<std::uint64_t> KernelSession::CloseConnection(std::uint64_t generation, std::string id) {
+    std::uint64_t requestId;
+    {
+        std::scoped_lock lock(state_->mutex, queueMutex_);
+        if (shutdownRequested_.load() || !state_->IsStreaming(generation) || state_->pendingSwitch ||
+            state_->pendingCloseId != 0 || !state_->HasConnection(id)) {
+            return std::nullopt;
+        }
+        requestId = ++state_->nextCloseId;
+        Command command;
+        command.type = CommandType::CloseConnection;
+        command.generation = generation;
+        command.connectionClose = {requestId, generation, std::move(id), {}};
+        queue_.push_back(std::move(command));
+        state_->pendingCloseId = requestId;
+    }
+    queueCv_.notify_all();
+    return requestId;
+}
+
+bool KernelSession::RefreshRules(std::uint64_t generation, std::string providerName) {
+    {
+        std::scoped_lock lock(state_->mutex, queueMutex_);
+        auto& rules = state_->rules;
+        if (shutdownRequested_.load() || !state_->CanAccessRules(generation) || rules.loading) {
+            return false;
+        }
+        if (!providerName.empty()) {
+            if (!rules.providers) {
+                return false;
+            }
+            const auto& providers = rules.providers->providers;
+            const auto provider = std::ranges::find(providers, providerName, &mihomo::RuleProviderInfo::name);
+            if (provider == providers.end() || !provider->CanRefresh()) {
+                return false;
+            }
+        }
+        Command command;
+        command.type = CommandType::RefreshRules;
+        command.generation = generation;
+        const bool updating = !providerName.empty();
+        command.ruleProviderName = std::move(providerName);
+        queue_.push_back(std::move(command));
+        rules.loading = true;
+        rules.updateStatus = updating ? RuleProviderUpdateStatus::Updating
+                                      : RuleProviderUpdateStatus::Idle;
+    }
+    Publish();
+    queueCv_.notify_all();
+    return true;
+}
+
 void KernelSession::Shutdown() {
     {
         std::scoped_lock lock(state_->mutex, queueMutex_);
         shutdownRequested_.store(true);
         state_->observer = nullptr;
+        state_->ResetStreams();
         queue_.clear();
     }
     cancelRequested_.store(true);
@@ -314,6 +478,12 @@ void KernelSession::WorkerMain() {
                 case CommandType::SwitchProfile:
                     HandleProfileSwitch(std::move(command));
                     break;
+                case CommandType::CloseConnection:
+                    HandleCloseConnection(std::move(command.connectionClose));
+                    break;
+                case CommandType::RefreshRules:
+                    HandleRefreshRules(command.generation, command.ruleProviderName);
+                    break;
                 case CommandType::ProcessExited:
                     HandleProcessExited(command.generation);
                     break;
@@ -344,7 +514,7 @@ void KernelSession::HandleShutdown() {
         state_->phase = KernelPhase::Stopped;
         state_->version.clear();
         state_->error = {};
-        state_->eventError.clear();
+        state_->ResetStreams();
         state_->runningProfileId.clear();
         state_->pendingSwitch.reset();
     }
@@ -452,7 +622,6 @@ core::Result<void> KernelSession::Launch(std::uint64_t generation, const LaunchC
         state_->configPath = config.copy->configPath;
         state_->generatedConfig = info.generated;
         state_->mixedPort = info.mixedPort;
-        state_->imported = config.imported;
     }
 
     process_ = drivers_->CreateProcess();
@@ -499,9 +668,14 @@ core::Result<void> KernelSession::Launch(std::uint64_t generation, const LaunchC
     handlers.onExited = [this, generation, status](int exitCode) {
         status->exitCode.store(exitCode);
         status->exited.store(true);
-        if (status->active.load() && IsCurrent(generation)) {
-            Enqueue({CommandType::ProcessExited, generation});
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (!status->active.load() || state_->generation != generation) {
+                return;
+            }
+            state_->acceptingEvents = false;
         }
+        Enqueue({CommandType::ProcessExited, generation});
     };
 
     if (!process_->Start(launch, std::move(handlers))) {
@@ -535,75 +709,6 @@ core::Result<void> KernelSession::Launch(std::uint64_t generation, const LaunchC
                 break;
             }
 
-            if (events_ == nullptr) {
-                mihomo::MihomoEventConfig eventConfig;
-                eventConfig.api = apiConfig;
-                events_ = drivers_->CreateEvents(eventConfig);
-            }
-            if (events_ != nullptr) {
-                auto state = state_;
-                auto dispatcher = dispatcher_;
-                if (options.connectTraffic) {
-                    core::Result<void> connected = events_->ConnectTraffic(
-                        [state, dispatcher, generation](const mihomo::TrafficStatistics& traffic) {
-                            if (!dispatcher) {
-                                return;
-                            }
-                            dispatcher([state, generation, traffic] {
-                                KernelSessionObserver* observer = nullptr;
-                                {
-                                    std::lock_guard<std::mutex> lock(state->mutex);
-                                    if (state->generation != generation ||
-                                        state->phase != KernelPhase::Running) {
-                                        return;
-                                    }
-                                    observer = state->observer;
-                                }
-                                if (observer != nullptr) {
-                                    observer->OnKernelTraffic(traffic.up, traffic.down);
-                                }
-                            });
-                        },
-                        [this, generation](const core::Error& error) {
-                            RecordEventError(generation, error);
-                        });
-                    if (!connected) {
-                        RecordEventError(generation, connected.error());
-                    }
-                }
-                if (options.connectConnections) {
-                    core::Result<void> connected = events_->ConnectConnections(
-                        [state, dispatcher, generation](
-                            const mihomo::ConnectionsSnapshot& connections) {
-                            if (!dispatcher) {
-                                return;
-                            }
-                            const int count = static_cast<int>(std::min<std::size_t>(
-                                connections.connections.size(), 1000000));
-                            dispatcher([state, generation, count] {
-                                KernelSessionObserver* observer = nullptr;
-                                {
-                                    std::lock_guard<std::mutex> lock(state->mutex);
-                                    if (state->generation != generation ||
-                                        state->phase != KernelPhase::Running) {
-                                        return;
-                                    }
-                                    observer = state->observer;
-                                }
-                                if (observer != nullptr) {
-                                    observer->OnKernelConnections(count);
-                                }
-                            });
-                        },
-                        1000, [this, generation](const core::Error& error) {
-                            RecordEventError(generation, error);
-                        });
-                    if (!connected) {
-                        RecordEventError(generation, connected.error());
-                    }
-                }
-            }
-
             {
                 std::lock_guard<std::mutex> lock(state_->mutex);
                 if (Cancelled() || state_->generation != generation || status->exited.load() ||
@@ -611,6 +716,15 @@ core::Result<void> KernelSession::Launch(std::uint64_t generation, const LaunchC
                     break;
                 }
                 state_->phase = KernelPhase::Running;
+                state_->acceptingEvents = true;
+                // Buffer first frames until the Running snapshot is queued.
+                state_->streamDispatchPending = true;
+                const auto initialStatus = [](bool enabled) {
+                    return StreamStatus{enabled ? StreamAvailability::Waiting : StreamAvailability::Disabled, {}};
+                };
+                state_->trafficStream = initialStatus(options.connectTraffic);
+                state_->connectionStream = initialStatus(options.connectConnections);
+                state_->logStream = initialStatus(options.connectLogs);
                 state_->version = version.value().version;
                 state_->error = {};
                 state_->runningProfileId = options.profile.id;
@@ -619,8 +733,14 @@ core::Result<void> KernelSession::Launch(std::uint64_t generation, const LaunchC
                     state_->pendingSwitch.reset();
                 }
             }
+            StartEvents(generation, options, apiConfig);
             core::MarkStartup("mihomo-api-ready");
             Publish();
+            {
+                std::lock_guard<std::mutex> lock(state_->mutex);
+                state_->streamDispatchPending = false;
+            }
+            DispatchStreams(state_, dispatcher_, generation);
             return {};
         }
 
@@ -646,6 +766,138 @@ core::Result<void> KernelSession::Launch(std::uint64_t generation, const LaunchC
     }
     return core::MakeError(core::ErrorKind::Timeout,
         !config.imported && lastError ? lastError.message : "Mihomo API did not become ready");
+}
+
+void KernelSession::HandleCloseConnection(ConnectionCloseResult result) {
+    auto state = state_;
+    const auto current = [&] {
+        return state->IsStreaming(result.generation) && state->pendingCloseId == result.requestId;
+    };
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!current()) {
+            return;
+        }
+        if (!state->HasConnection(result.connectionId)) {
+            result.error = core::MakeError(core::ErrorKind::Cancelled, "Connection is no longer available");
+        }
+    }
+    if (!result.error) {
+        try {
+            const auto closed = api_->CloseConnection(result.connectionId);
+            if (!closed) {
+                result.error = core::MakeError(closed.error().kind, "Mihomo could not close the connection",
+                                               closed.error().httpStatus);
+            }
+        } catch (...) {
+            result.error = core::MakeError(core::ErrorKind::Internal, "Mihomo could not close the connection");
+        }
+    }
+    const auto resetPending = [&] {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (current()) {
+            state->pendingCloseId = 0;
+        }
+    };
+    if (!dispatcher_) {
+        resetPending();
+        return;
+    }
+    try {
+        dispatcher_([state, result] {
+            KernelSessionObserver* observer = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (!state->IsStreaming(result.generation) || state->pendingCloseId != result.requestId) {
+                    return;
+                }
+                state->pendingCloseId = 0;
+                observer = state->observer;
+            }
+            if (observer) {
+                observer->OnKernelConnectionClose(result);
+            }
+        });
+    } catch (...) {
+        resetPending();
+    }
+}
+
+void KernelSession::HandleRefreshRules(std::uint64_t generation, const std::string& providerName) {
+    const auto current = [&] {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        return state_->CanAccessRules(generation);
+    };
+    if (!current()) {
+        return;
+    }
+
+    RulesSnapshot result;
+    if (!providerName.empty()) {
+        result.updateStatus = RuleProviderUpdateStatus::UpdateFailed;
+        try {
+            if (api_->UpdateRuleProvider(providerName)) {
+                result.updateStatus = RuleProviderUpdateStatus::ReadbackFailed;
+            }
+        } catch (...) {
+            // The view reports the failed operation without exposing controller details.
+        }
+    }
+    if (result.updateStatus != RuleProviderUpdateStatus::UpdateFailed) {
+        if (!current()) {
+            return;
+        }
+        result.rulesStatus = RulesLoadStatus::Failed;
+        try {
+            auto rules = api_->GetRules();
+            if (rules) {
+                result.rules = std::make_shared<const mihomo::RuleCollection>(std::move(rules.value()));
+                result.rulesStatus = RulesLoadStatus::Ready;
+            }
+        } catch (...) {
+            // An error in one collection must not prevent reading the other.
+        }
+        if (!current()) {
+            return;
+        }
+        result.providersStatus = RulesLoadStatus::Failed;
+        try {
+            auto providers = api_->GetRuleProviders();
+            if (providers) {
+                result.providers = std::make_shared<const mihomo::RuleProviderCollection>(
+                    std::move(providers.value()));
+                result.providersStatus = RulesLoadStatus::Ready;
+            }
+        } catch (...) {
+        }
+        if (!providerName.empty() && result.rules && result.providers) {
+            const auto& providers = result.providers->providers;
+            if (std::ranges::find(providers, providerName, &mihomo::RuleProviderInfo::name) != providers.end()) {
+                result.updateStatus = RuleProviderUpdateStatus::Updated;
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->CanAccessRules(generation)) {
+            return;
+        }
+        auto& rules = state_->rules;
+        if (result.rules) {
+            rules.rules = std::move(result.rules);
+        }
+        if (result.providers) {
+            rules.providers = std::move(result.providers);
+        }
+        if (result.updateStatus != RuleProviderUpdateStatus::UpdateFailed) {
+            rules.rulesStatus = result.rulesStatus;
+            rules.providersStatus = result.providersStatus;
+        }
+        rules.updateStatus = result.updateStatus;
+        rules.loading = false;
+    }
+    Publish();
 }
 
 void KernelSession::HandleProfileSwitch(Command command) {
@@ -694,7 +946,7 @@ void KernelSession::HandleProfileSwitch(Command command) {
         state_->phase = KernelPhase::Starting;
         state_->runningProfileId.clear();
         state_->version.clear();
-        state_->eventError.clear();
+        state_->ResetStreams();
         state_->error = {};
         return true;
     };
@@ -778,7 +1030,7 @@ void KernelSession::HandleStop(std::uint64_t generation) {
             state_->runningProfileId.clear();
             state_->version.clear();
             state_->error = {};
-            state_->eventError.clear();
+            state_->ResetStreams();
             publish = true;
         }
     }
@@ -801,7 +1053,7 @@ void KernelSession::HandleRestart(std::uint64_t generation) {
             state_->runningProfileId.clear();
             state_->version.clear();
             state_->error = {};
-            state_->eventError.clear();
+            state_->ResetStreams();
         }
     }
     Publish();
@@ -821,7 +1073,7 @@ void KernelSession::BeginStartSession(std::uint64_t& generation) {
         state_->phase = KernelPhase::Starting;
         state_->version.clear();
         state_->error = {};
-        state_->eventError.clear();
+        state_->ResetStreams();
         state_->configPath.clear();
         state_->generatedConfig = false;
         cancelRequested_.store(false);
@@ -859,6 +1111,7 @@ void KernelSession::Fail(std::uint64_t generation, core::ErrorKind kind, std::st
         if (state_->generation == generation && state_->phase != KernelPhase::Stopping &&
             state_->phase != KernelPhase::Stopped) {
             state_->phase = KernelPhase::Failed;
+            state_->ResetStreams();
             state_->runningProfileId.clear();
             state_->version.clear();
             state_->error = core::MakeError(kind, std::move(message));
@@ -880,18 +1133,7 @@ void KernelSession::Publish() {
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         publication = ++state_->nextPublication;
-        snapshot.phase = state_->phase;
-        snapshot.generation = state_->generation;
-        snapshot.version = state_->version;
-        snapshot.apiAddress = state_->apiAddress;
-        snapshot.configPath = state_->configPath;
-        snapshot.generatedConfig = state_->generatedConfig;
-        snapshot.mixedPort = state_->mixedPort;
-        snapshot.error = state_->error;
-        snapshot.eventError = state_->eventError;
-        snapshot.runningProfileId = state_->runningProfileId;
-        snapshot.profileSwitchInProgress = state_->pendingSwitch.has_value();
-        snapshot.profileSwitchResult = state_->switchResult;
+        snapshot = state_->MakeSnapshot();
         observer = state_->observer;
     }
     if (observer == nullptr) {
@@ -899,7 +1141,7 @@ void KernelSession::Publish() {
     }
     auto state = state_;
     try {
-        dispatcher_([state, snapshot, publication] {
+        dispatcher_([state, snapshot, publication]() mutable {
             KernelSessionObserver* current = nullptr;
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
@@ -908,6 +1150,11 @@ void KernelSession::Publish() {
                     return;
                 }
                 state->deliveredPublication = publication;
+                if (snapshot.rulesAvailable) {
+                    // A profile switch can clear rules before the generation advances.
+                    snapshot.rulesAvailable = state->CanAccessRules(snapshot.generation);
+                    snapshot.rules = snapshot.rulesAvailable ? state->rules : RulesSnapshot{};
+                }
                 current = state->observer;
             }
             current->OnKernelSnapshot(snapshot);
@@ -917,15 +1164,157 @@ void KernelSession::Publish() {
     }
 }
 
-void KernelSession::RecordEventError(std::uint64_t generation, const core::Error& error) {
+void KernelSession::StartEvents(std::uint64_t generation, const KernelOptions& options,
+                                const mihomo::MihomoApiConfig& apiConfig) {
+    if (!options.connectTraffic && !options.connectConnections && !options.connectLogs) {
+        return;
+    }
+    mihomo::MihomoEventConfig config;
+    config.api = apiConfig;
+    events_ = drivers_->CreateEvents(config);
+
+    auto state = state_;
+    auto dispatcher = dispatcher_;
+    auto update = [state, dispatcher, generation](StreamStatus SharedState::*stream,
+                                                    const char* error, auto store) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->IsStreaming(generation)) {
+                return;
+            }
+            auto& status = state.get()->*stream;
+            const auto availability = error ? StreamAvailability::Disconnected
+                                            : StreamAvailability::Available;
+            if (status.availability != availability) {
+                status = {availability, error ? error : ""};
+                state->streamStatusDirty = true;
+            }
+            store(*state);
+        }
+        DispatchStreams(state, dispatcher, generation);
+    };
+    auto reportError = [update](StreamStatus SharedState::*stream, const char* message) {
+        return [update, stream, message](const core::Error&) {
+            update(stream, message, [stream](SharedState& state) {
+                if (stream == &SharedState::connectionStream) {
+                    state.connections.reset();
+                    state.connectionsDirty = false;
+                } else if (stream == &SharedState::trafficStream) {
+                    state.traffic.reset();
+                }
+            });
+        };
+    };
+    const auto unavailable = core::MakeError(core::ErrorKind::ConnectionFailed,
+                                             "Mihomo event driver is unavailable");
+    if (options.connectTraffic) {
+        auto onError = reportError(&SharedState::trafficStream, "Mihomo traffic stream is unavailable");
+        const auto connected = events_ ? events_->ConnectTraffic(
+            [update](const mihomo::TrafficStatistics& traffic) {
+                update(&SharedState::trafficStream, nullptr,
+                       [&traffic](SharedState& state) { state.traffic = traffic; });
+            }, onError) : core::Result<void>(unavailable);
+        if (!connected) {
+            onError(connected.error());
+        }
+    }
+    if (options.connectConnections) {
+        auto onError = reportError(&SharedState::connectionStream, "Mihomo connection stream is unavailable");
+        const auto connected = events_ ? events_->ConnectConnections(
+            [update](const mihomo::ConnectionsSnapshot& connections) {
+                update(&SharedState::connectionStream, nullptr, [&connections](SharedState& state) {
+                    state.connections = std::make_shared<mihomo::ConnectionsSnapshot>(connections);
+                    state.connectionsDirty = true;
+                });
+            }, 1000, onError) : core::Result<void>(unavailable);
+        if (!connected) {
+            onError(connected.error());
+        }
+    }
+    if (options.connectLogs) {
+        auto onError = reportError(&SharedState::logStream, "Mihomo log stream is unavailable");
+        const auto connected = events_ ? events_->ConnectLogs(
+            [update](const mihomo::MihomoLogEntry& entry) {
+                update(&SharedState::logStream, nullptr, [&entry](SharedState& state) {
+                    if (state.logs.size() == kPendingLogLimit) {
+                        state.logs.pop_front();
+                    }
+                    state.logs.push_back({
+                        SanitizeLogField(entry.type, state.logRedactions, state.apiConfig.secret, 32),
+                        SanitizeLogField(entry.payload, state.logRedactions, state.apiConfig.secret,
+                                         kLogPayloadBytes)});
+                });
+            }, onError) : core::Result<void>(unavailable);
+        if (!connected) {
+            onError(connected.error());
+        }
+    }
+}
+
+void KernelSession::DispatchStreams(const std::shared_ptr<SharedState>& state,
+                                    const Dispatcher& dispatcher, std::uint64_t generation) {
     {
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        if (state_->generation != generation || !state_->eventError.empty()) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const bool hasUpdates = state->streamStatusDirty || state->connectionsDirty ||
+                                state->traffic.has_value() || !state->logs.empty();
+        if (!dispatcher || !state->observer || !state->IsStreaming(generation) ||
+            state->streamDispatchPending || !hasUpdates) {
             return;
         }
-        state_->eventError = state_->imported ? "Mihomo event stream is unavailable" : error.message;
+        state->streamDispatchPending = true;
     }
-    Publish();
+    try {
+        dispatcher([state, generation] {
+            std::optional<KernelSnapshot> snapshot;
+            std::optional<mihomo::TrafficStatistics> traffic;
+            std::shared_ptr<const mihomo::ConnectionsSnapshot> connections;
+            std::deque<mihomo::MihomoLogEntry> logs;
+            KernelSessionObserver* observer = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (!state->IsStreaming(generation)) {
+                    return;
+                }
+                state->streamDispatchPending = false;
+                observer = state->observer;
+                if (!observer) {
+                    return;
+                }
+                if (std::exchange(state->streamStatusDirty, false)) {
+                    snapshot = state->MakeSnapshot();
+                    state->deliveredPublication = ++state->nextPublication;
+                }
+                traffic = std::exchange(state->traffic, std::nullopt);
+                if (std::exchange(state->connectionsDirty, false)) {
+                    connections = state->connections;
+                }
+                logs.swap(state->logs);
+            }
+            const auto stillCurrent = [&] {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                return state->IsStreaming(generation) && state->observer == observer;
+            };
+            if (snapshot && stillCurrent()) {
+                observer->OnKernelSnapshot(*snapshot);
+            }
+            if (traffic && stillCurrent()) {
+                observer->OnKernelTraffic(traffic->up, traffic->down);
+            }
+            if (connections && stillCurrent()) {
+                observer->OnKernelConnections(generation, *connections);
+            }
+            if (!logs.empty() && stillCurrent()) {
+                const std::vector<mihomo::MihomoLogEntry> batch(std::make_move_iterator(logs.begin()),
+                                                             std::make_move_iterator(logs.end()));
+                observer->OnKernelLogs(generation, batch);
+            }
+        });
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->IsStreaming(generation)) {
+            state->streamDispatchPending = false;
+        }
+    }
 }
 
 bool KernelSession::IsCurrent(std::uint64_t generation) const {
@@ -1005,12 +1394,30 @@ private:
 
 class RealApiDriver final : public KernelApiDriver {
 public:
-    explicit RealApiDriver(mihomo::MihomoApiConfig config) : client_(std::move(config)) {}
+    explicit RealApiDriver(mihomo::MihomoApiConfig config)
+        : client_(config), rulesClient_(RulesConfig(std::move(config))) {}
 
     core::Result<mihomo::MihomoVersion> GetVersion() override { return client_.GetVersion(); }
+    core::Result<void> CloseConnection(std::string_view id) override {
+        return client_.CloseConnection(id);
+    }
+    core::Result<mihomo::RuleCollection> GetRules() override { return rulesClient_.GetRules(); }
+    core::Result<mihomo::RuleProviderCollection> GetRuleProviders() override {
+        return rulesClient_.GetRuleProviders();
+    }
+    core::Result<void> UpdateRuleProvider(std::string_view name) override {
+        return rulesClient_.UpdateRuleProvider(name);
+    }
 
 private:
+    static mihomo::MihomoApiConfig RulesConfig(mihomo::MihomoApiConfig config) {
+        // Rule provider updates may wait for Mihomo to fetch a remote provider.
+        config.readTimeoutMs = 5000;
+        return config;
+    }
+
     mihomo::MihomoApiClient client_;
+    mihomo::MihomoApiClient rulesClient_;
 };
 
 class RealEventDriver final : public KernelEventDriver {
@@ -1024,6 +1431,10 @@ public:
     core::Result<void> ConnectConnections(ConnectionHandler handler, int intervalMs,
                                           ErrorHandler onError) override {
         return client_.ConnectConnections(std::move(handler), intervalMs, std::move(onError));
+    }
+
+    core::Result<void> ConnectLogs(LogHandler handler, ErrorHandler onError) override {
+        return client_.ConnectLogs(std::move(handler), "debug", std::move(onError));
     }
 
     void Disconnect() override { client_.Disconnect(); }

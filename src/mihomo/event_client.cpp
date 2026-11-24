@@ -256,6 +256,10 @@ core::Result<void> MihomoEventClient::ConnectLogs(LogHandler handler, std::strin
     return impl_->Start(
         EventChannel::Logs, "/logs?level=" + level,
         [handler = std::move(handler)](const std::string& message) {
+            constexpr std::size_t kMaxLogFrameBytes = 64 * 1024;
+            if (message.size() > kMaxLogFrameBytes) {
+                return;
+            }
             const auto json = nlohmann::json::parse(message, nullptr, false);
             if (json.is_discarded()) {
                 return;

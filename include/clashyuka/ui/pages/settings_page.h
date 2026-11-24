@@ -27,18 +27,34 @@ private:
     void SaveMihomoSettings();
     void SyncMihomoSettings();
     void ApplyKernelUpdate(const app::AppStateSnapshot& state);
+    void ApplyAppUpdate(const runtime::AppUpdateSnapshot& update);
+
+    TextBlock* appUpdateLine_ = nullptr;
+    Button* checkAppUpdate_ = nullptr;
+    Button* cancelAppUpdate_ = nullptr;
+    Button* openAppRelease_ = nullptr;
+    std::shared_ptr<const runtime::AppUpdateSnapshot> shownAppUpdate_;
 
     Button* lightButton_ = nullptr;
     Button* darkButton_ = nullptr;
     std::array<Button*, 4> themeButtons_{};
     Switch* animations_ = nullptr;
     Switch* reducedMotion_ = nullptr;
+#ifdef __WXMSW__
+    void SyncDesktopSettings(bool resetFields = false);
+    Switch* closeToTray_ = nullptr;
+    SearchField* windowHotkey_ = nullptr;
+    Button* saveDesktop_ = nullptr;
+    TextBlock* desktopStatus_ = nullptr;
+    bool desktopFieldsInitialized_ = false;
+#endif
     SearchField* kernelPathField_ = nullptr;
     SearchField* apiPortField_ = nullptr;
     SearchField* secretField_ = nullptr;
     Switch* autoStart_ = nullptr;
     Switch* systemProxy_ = nullptr;
     TextBlock* systemProxyStatus_ = nullptr;
+    Button* systemProxyRetry_ = nullptr;
     SearchField* testUrlField_ = nullptr;
     SearchField* testTimeoutField_ = nullptr;
     SearchField* installDirField_ = nullptr;

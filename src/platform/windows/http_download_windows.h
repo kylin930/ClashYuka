@@ -5,6 +5,6 @@
 
 namespace clashyuka::platform::detail {
 
-bool ConfigureBoundedHttpsRequest(HINTERNET request);
+bool ConfigureBoundedHttpsRequest(HINTERNET request, bool followRedirects = true);
 
 }  // namespace clashyuka::platform::detail

@@ -135,8 +135,10 @@ struct RuleProviderInfo {
     std::string type;
     std::string behavior;
     std::string vehicleType;
-    std::uint64_t updatedAt = 0;
+    std::string updatedAt;
     int ruleCount = 0;
+
+    bool CanRefresh() const { return vehicleType == "HTTP" || vehicleType == "File"; }
 };
 
 struct RuleProviderCollection {

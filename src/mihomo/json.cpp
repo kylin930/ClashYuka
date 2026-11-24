@@ -1,5 +1,6 @@
 #include "clashyuka/mihomo/json.h"
 
+#include <charconv>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -41,6 +42,26 @@ int IntOr(const Json& object, const char* key, int fallback = 0) {
     return static_cast<int>(value->get<double>());
 }
 
+int PortOrZero(const Json& metadata, const char* key) {
+    const auto* value = Member(metadata, key);
+    if (value == nullptr) {
+        return 0;
+    }
+    if (value->is_number_integer() && *value >= 0 && *value <= 65535) {
+        return value->get<int>();
+    }
+    if (value->is_string()) {
+        const auto& text = value->get_ref<const std::string&>();
+        int port = 0;
+        const auto end = text.data() + text.size();
+        const auto result = std::from_chars(text.data(), end, port);
+        if (result.ec == std::errc{} && result.ptr == end && port >= 0 && port <= 65535) {
+            return port;
+        }
+    }
+    return 0;
+}
+
 std::int64_t Int64Or(const Json& object, const char* key, std::int64_t fallback = 0) {
     const Json* value = Member(object, key);
     if (value == nullptr || !value->is_number()) {
@@ -54,8 +75,15 @@ std::uint64_t UInt64Or(const Json& object, const char* key, std::uint64_t fallba
     if (value == nullptr || !value->is_number()) {
         return fallback;
     }
+    if (value->is_number_unsigned()) {
+        return value->get<std::uint64_t>();
+    }
+    if (value->is_number_integer()) {
+        const auto number = value->get<std::int64_t>();
+        return number >= 0 ? static_cast<std::uint64_t>(number) : fallback;
+    }
     const double number = value->get<double>();
-    return number > 0 ? static_cast<std::uint64_t>(number) : fallback;
+    return number >= 0 && number < 0x1p64 ? static_cast<std::uint64_t>(number) : fallback;
 }
 
 double DoubleOr(const Json& object, const char* key, double fallback = 0.0) {
@@ -276,8 +304,12 @@ core::Result<ConnectionsSnapshot> ParseConnections(const Json& json) {
     snapshot.uploadTotal = UInt64Or(json, "uploadTotal");
     snapshot.memory = UInt64Or(json, "memory");
 
-    const Json* connections = Member(json, "connections");
-    if (connections == nullptr) {
+    const auto connections = json.find("connections");
+    if (connections == json.end()) {
+        return MakeError(ErrorKind::MissingField, "missing field 'connections'");
+    }
+    // A nil Mihomo connection slice can be serialized as null.
+    if (connections->is_null()) {
         return snapshot;
     }
     if (!connections->is_array()) {
@@ -309,8 +341,8 @@ core::Result<ConnectionsSnapshot> ParseConnections(const Json& json) {
             connection.metadata.host = StringOr(*metadata, "host");
             connection.metadata.dnsMode = StringOr(*metadata, "dnsMode");
             connection.metadata.processPath = StringOr(*metadata, "processPath");
-            connection.metadata.sourcePort = IntOr(*metadata, "sourcePort");
-            connection.metadata.destinationPort = IntOr(*metadata, "destinationPort");
+            connection.metadata.sourcePort = PortOrZero(*metadata, "sourcePort");
+            connection.metadata.destinationPort = PortOrZero(*metadata, "destinationPort");
         }
 
         snapshot.connections.push_back(std::move(connection));
@@ -323,10 +355,15 @@ core::Result<MihomoLogEntry> ParseLog(const Json& json) {
         return MakeError(ErrorKind::TypeMismatch, "log payload is not a JSON object");
     }
 
-    MihomoLogEntry entry;
-    entry.type = StringOr(json, "type");
-    entry.payload = StringOr(json, "payload");
-    return entry;
+    const Json* type = Member(json, "type");
+    const Json* payload = Member(json, "payload");
+    if (type == nullptr || payload == nullptr) {
+        return MakeError(ErrorKind::MissingField, "log message requires type and payload");
+    }
+    if (!type->is_string() || !payload->is_string() || type->get_ref<const std::string&>().empty()) {
+        return MakeError(ErrorKind::TypeMismatch, "invalid log message type or payload");
+    }
+    return MihomoLogEntry{type->get<std::string>(), payload->get<std::string>()};
 }
 
 core::Result<ProxyProviderCollection> ParseProxyProviders(const Json& json) {
@@ -396,11 +433,15 @@ core::Result<RuleProviderCollection> ParseRuleProviders(const Json& json) {
         }
 
         RuleProviderInfo provider;
-        provider.name = StringOr(item.value(), "name", item.key());
+        // The object key is the name accepted by the provider update endpoint.
+        provider.name = item.key();
         provider.type = StringOr(item.value(), "type");
         provider.behavior = StringOr(item.value(), "behavior");
         provider.vehicleType = StringOr(item.value(), "vehicleType");
-        provider.updatedAt = UInt64Or(item.value(), "updatedAt");
+        provider.updatedAt = StringOr(item.value(), "updatedAt");
+        if (const auto timestamp = UInt64Or(item.value(), "updatedAt"); timestamp != 0) {
+            provider.updatedAt = std::to_string(timestamp);
+        }
         provider.ruleCount = IntOr(item.value(), "ruleCount");
         collection.providers.push_back(std::move(provider));
     }
