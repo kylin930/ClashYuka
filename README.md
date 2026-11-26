@@ -1,238 +1,76 @@
 # ClashYuka
 
-基于 Mihomo 的轻量级原生桌面代理客户端。当前完成 P0（工程基础）、P1（Mihomo Core 集成与通信层）、P2.0（MD3 自绘 UI 系统）、P2.0.1（Material Motion 打磨）与 P2.1（原生应用框架）。
+ClashYuka 是基于 wxWidgets 的 Windows 桌面客户端，通过 Mihomo（Clash.Meta）内核提供代理配置管理、节点选择、实时监控与系统代理控制。
 
-## 技术栈
+## 功能
 
-- C++20 / CMake 3.31（Ninja Multi-Config）
-- wxWidgets 3.3.1（Windows 使用本机静态库）
-- cpp-httplib / nlohmann-json / yaml-cpp（FetchContent 固定版本）
-- doctest（测试）
+- **Dashboard**：实时上传/下载速率、累计流量、内存占用、活跃连接数。
+- **Proxies**：代理组与节点列表、节点切换、单节点/整组延迟测试、Rule/Global/Direct 模式切换、名称搜索与排序。
+- **Profiles**：远程订阅与本地配置管理，支持 Merge / Script 处理链，激活配置后自动重启内核并刷新界面。
+- **Connections**：实时连接列表，支持按代理链筛选、搜索、排序与关闭连接。
+- **Rules**：规则列表展示、按代理筛选与搜索。
+- **Logs**：内核实时日志，支持级别筛选、搜索与自动滚动。
+- **Providers**：代理/规则 provider 查看、更新与健康检查。
+- **Settings**：系统代理与代理守卫、开机自启、主题与语言、内核与端口、TUN、热键、调试信息、关于页。
 
-## 模块
+其他能力：系统托盘与静默启动、全局热键、系统代理守卫、配置迁移、内核下载与更新检查、Windows 服务模式。
 
-| 模块 | 位置 | 说明 |
-| --- | --- | --- |
-| MD3 主题令牌 | `include/clashyuka/ui/theme` | 4 套配色 × Light/Dark、字体、圆角、间距、DPI |
-| 绘制层 | `include/clashyuka/ui/drawing` | Painter、矢量图标、统一动画管理器、MotionTokens、Ripple |
-| 组件库 | `include/clashyuka/ui/components` | Card/Button/IconButton/Switch/ListItem/Rail/Tab/Dialog/Snackbar/Progress/SearchField |
-| 应用状态 | `include/clashyuka/app/app_state.h` | `AppStateSnapshot`、内核/API/页面/主题/代理模式等状态与观察者 |
-| 应用控制器 | `include/clashyuka/app/app_controller.h` | 导航、主题偏好、Snackbar/Dialog 入口与 P2.2 状态上报钩子 |
-| 页面注册 | `include/clashyuka/app/page_registry.h` | 6 个页面的标题、描述、图标与延迟创建 |
-| 主窗口 | `include/clashyuka/ui/main_window.h` | NavigationRail、顶部标题栏、页面容器、底部状态栏 |
-| 应用页面 | `include/clashyuka/ui/pages` | Overview / Proxies / Connections / Profiles / Logs / Settings |
-| 数据模型与 JSON 解析 | `include/clashyuka/mihomo/types.h`, `src/mihomo/json.cpp` | 容错解析，未知字段/类型不匹配不会导致崩溃 |
-| 统一错误 | `include/clashyuka/core/result.h` | `ErrorKind` + `Result<T>`，不向调用方暴露 httplib/nlohmann 异常 |
-| REST 客户端 | `include/clashyuka/mihomo/api_client.h` | 每次请求独立连接，可跨线程使用 |
-| WebSocket 客户端 | `include/clashyuka/mihomo/event_client.h` | 按需连接，后台线程，断线重连，安全退出 |
-| 进程管理 | `include/clashyuka/mihomo/process.h` | 跨平台进程后端，捕获输出与退出码 |
-| 平台适配 | `src/platform/{windows,posix}` | 进程启动/等待只在平台层使用系统 API |
+## 目录结构
 
-### REST API
-
-所有请求带 `Authorization: Bearer <secret>`；控制器默认 `127.0.0.1`，拒绝 `0.0.0.0`/`::` 等通配地址。
-
-| 方法 | 路径 | 客户端方法 |
-| --- | --- | --- |
-| GET | `/version` | `GetVersion()` |
-| GET | `/proxies` | `GetProxies()` |
-| GET | `/proxies/{name}` | `GetProxy(name)` |
-| PUT | `/proxies/{group}` | `SelectProxy(group, target)`，body `{"name": target}` |
-| GET | `/configs` | `GetConfigs()` |
-| PATCH | `/configs` | `PatchConfigs(patch)` |
-| GET | `/rules` | `GetRules()` |
-| GET | `/connections` | `GetConnections()` |
-| GET | `/providers/proxies` | `GetProxyProviders()` |
-| GET | `/providers/rules` | `GetRuleProviders()` |
-
-节点/代理组名称按 RFC 3986 逐段百分号编码（空格、中文、`/` 都会被编码）。
-
-错误分类：`InvalidConfig`、`ConnectionFailed`、`KernelNotRunning`、`Timeout`、`HttpStatus`、`AuthFailed`、`InvalidJson`、`MissingField`、`TypeMismatch`。
-
-### WebSocket
-
-Mihomo 的 `/logs`、`/traffic`、`/memory`、`/connections` 官方同时支持 `GET` 与 `WS`。流式读取只通过 WebSocket 实现：
-
-- `ConnectTraffic`：默认必要的实时流量连接
-- `ConnectLogs(handler, level)`
-- `ConnectConnections(handler, intervalMs)`
-- `ConnectMemory`
-- `Disconnect(channel)` / `Disconnect()`
-
-所有回调在后台线程执行，GUI 必须通过 `wxTheApp->CallAfter` 或 `wxQueueEvent` 切回主线程。默认不自动连接任何通道；实例析构会断开并 join 所有工作线程。
-
-### 进程管理
-
-`MihomoProcess` 支持 Start/Stop/Restart/IsRunning/GetPid/GetExitCode，捕获 stdout/stderr 行，并通过监控线程上报退出码。内核路径与参数（如 `-f config.yaml -d home`）由调用方显式提供，不自动下载或替换内核。
-
-`wxProcess` 已评估，但其退出通知依赖 GUI 消息泵，无法在无界面验证和关闭时序中可靠工作；因此启动/等待放在 `src/platform` 后端中实现，公共模块不出现 `CreateProcess`/`fork`。
-
-Windows 停止流程：GUI 进程无控制台时先 `AttachConsole` 并向子进程组发送 `CTRL_BREAK_EVENT`，等待 3 秒后才 `TerminateProcess`；测试进程自带控制台，因此自动化测试只验证强制终止路径。
-
-## MD3 设计系统
-
-- 主题：Purple / Blue / Teal / Orange，每套都有完整 Light/Dark 颜色令牌
-- 切换主题与深浅色无需重启，组件通过 `ThemeManager` 观察者即时重绘
-- 动画由单个 `wxTimer`（16ms）驱动的 `AnimationManager` 统一调度，组件不自建定时器
-- 所有尺寸通过 `wxWindow::FromDIP` 缩放；不直接使用物理像素
-- 自定义图标为 24×24 网格矢量描边，无外部图标资源
-
-### 动效（P2.0.1）
-
-时长与曲线集中在 `include/clashyuka/ui/drawing/motion_tokens.h`，组件内不写魔法数字：
-
-| 动效 | 时长 |
-| --- | --- |
-| Hover / Disabled 颜色 | 140ms |
-| Press / Release | 110 / 130ms |
-| Focus 状态层 | 120ms |
-| Switch、Tab、NavigationRail | 180 / 200 / 200ms |
-| Surface / Dialog / Snackbar 进入 | 200ms |
-| Surface 退出 | 160ms |
-| 页面切换 | 180ms |
-| Ripple | 420ms |
-| 进度插值 | 220ms |
-
-曲线：`Linear`、`Standard (0.2, 0, 0, 1)`、`EmphasizedDecelerate`、`EmphasizedAccelerate`、`EaseOutCubic`、`EaseInOutCubic`，贝塞尔曲线内置求解，无外部依赖。
-
-- Button / IconButton：Hover、Press 缩放、按点击位置发起的 Ripple（圆角裁剪）、键盘 Focus 状态层（无描边焦点框）、Disabled 过渡
-- Switch：Thumb 位置与尺寸、Track 颜色同步动画
-- ListItem：Hover / Pressed / 选中态背景与前景色过渡、按点击位置发起的 Ripple（圆角裁剪），不改变布局
-- SurfaceCard：Hover / Pressed 背景与描边过渡
-- NavigationRail / TabBar：指示器平滑移动、宽度变化、文字颜色交叉渐变
-- Dialog：无系统标题栏的 MD3 圆角窗口（`SetShape` 裁剪）、自绘标题行与关闭图标、标题区可拖动；整窗淡入 + 内容轻微上移，关闭/ESC 时反向淡出下滑后再结束模态循环（Windows 分层窗口；其他平台保持不透明）；Snackbar：滑入淡入、可复用同一条消息实例
-- ProgressIndicator：确定进度插值并带完成脉冲；不确定进度连续旋转
-- 页面切换：新页面轻微上滑进入，快速连续切换会重置上一段动画
-
-关闭动画或开启 Reduced Motion 时，所有动画立即到达最终状态，交互与状态仍然可用；不执行 Ripple、缩放、位移与旋转。
-
-## 应用框架（P2.1）
-
-启动 `ClashYuka.exe` 后进入真正的客户端主界面，不再加载组件 Demo：
-
-- 左侧 NavigationRail：Dashboard / Proxies / Connections / Profiles / Logs / Settings，窗口窄于 1000 DIP 时自动折叠为图标栏
-- 顶部：页面标题、描述与全局设置入口
-- 中部：可滚动的页面容器，页面按需创建并保留状态
-- 底部状态栏：内核状态、API 连接状态、Mihomo 版本与代理模式，全部来自 AppState（当前为 Not started / Disconnected / Unknown）
-- 页面切换使用轻量上滑动画，NavigationRail 指示器同步移动
-
-架构要点：
-
-- `AppController` 是导航、主题偏好和消息入口的唯一协调者；页面不直接访问 Mihomo 或全局状态
-- `AppState` 保存快照并通过观察者同步通知，通知使用快照副本，允许观察者在回调中订阅或退订
-- 页面通过 `PageBase` 注册观察者，只读状态并用现有 MD3 组件渲染
-- 所有 Mock/占位内容均显式标注（Demo data / Not implemented / P2.2），未实现的操作只打开说明 Dialog，不伪造成功
-- Proxies / Connections / Logs / Profiles 的搜索、筛选、展开、清空等交互在本地演示数据上真实生效；节点切换、订阅、日志流等业务留待后续阶段
-
-界面截图位于 `docs/screenshots/`：
-
-- 页面：`p21-overview-light.png`、`p21-overview-dark.png`、`p21-proxies.png`、`p21-connections.png`、`p21-profiles.png`、`p21-logs.png`、`p21-settings.png`、`p21-settings-scrolled.png`
-- 主题：`p21-theme-purple.png`、`p21-theme-blue.png`、`p21-theme-teal.png`、`p21-theme-orange.png`
-- 交互状态：`p21-animations-off.png`、`p21-reduced-motion.png`、`p21-dialog.png`、`p21-snackbar.png`
-- 窗口缩放：`p21-window-narrow.png`、`p21-window-restored.png`
-
-## 平台状态
-
-| 平台 | 状态 |
-| --- | --- |
-| Windows 10/11 x64 (MSVC) | 已构建 Debug/Release，单元/Mock/真实内核集成测试通过 |
-| macOS | 仅 CMake Preset，未构建验证（POSIX 进程后端已提供） |
-| Linux | 仅 CMake Preset，未构建验证（POSIX 进程后端已提供） |
+```text
+ClashYuka/                  顶层 CMake 工程，负责 wxWidgets 与第三方依赖
+├── ClashYuka/              可执行目标
+│   ├── src/
+│   │   ├── main.cpp
+│   │   ├── core/           内核进程、API/WS 客户端、配置、托盘、系统代理、服务等
+│   │   ├── service/        Windows 服务模式入口
+│   │   └── ui/             主窗口、主题与各功能页面
+│   ├── tests/              API 服务层测试与真实内核集成测试（默认关闭）
+│   └── packaging/windows/  Inno Setup 脚本、版本资源与 manifest
+├── CMakeLists.txt
+└── CMakePresets.json
+```
 
 ## 构建
 
-### Windows（CLI）
+环境要求：
 
-CLI 与 Visual Studio 使用**不同**构建目录，避免同时写同一个 binaryDir：
+- Windows 10/11，Visual Studio 2022（MSVC x64 工具链）
+- CMake 3.20+ 与 Ninja
+- wxWidgets 3.3 静态库（`/MT` 运行时）构建，默认路径为 `G:/Documents/wxwidgetsBuild`，可在顶层 `CMakeLists.txt` 的 `WX_ROOT` 中修改
+- 首次配置需要网络访问 GitHub（FetchContent 拉取 nlohmann/json、yaml-cpp、mbedtls、IXWebSocket）
 
-- CLI：`out/build/windows-x64`
-- Visual Studio：`out/build/vs/windows-x64`（Preset：`vs-windows-x64`）
-
-```powershell
-& 'G:\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64 -HostArch amd64
-
-cmake --preset windows-x64-release
-cmake --build --preset windows-x64-debug
-cmake --build --preset windows-x64-release
-```
-
-输出：`out/build/windows-x64/bin/{Debug,Release}/ClashYuka.exe`。
-
-Visual Studio 以「打开文件夹」方式打开仓库，在配置下拉框中选择 `Visual Studio (separate build dir)`。不需要 `.sln`/`.vcxproj`。
-
-### macOS / Linux
-
-```bash
-cmake --preset macos    # 或 linux
-cmake --build --preset macos-debug
-cmake --build --preset macos-release
-```
-
-需要系统安装 wxWidgets，不复用 Windows 静态库。
-
-## 测试
+Release 构建：
 
 ```powershell
-ctest --preset windows-x64-release --output-on-failure
-ctest --preset windows-x64-debug --output-on-failure
+cmake --preset x64-release
+cmake --build out/build/x64-release
 ```
 
-包含四个 CTest 目标：
+Debug 构建使用 `x64-debug` 预设。产物为 `out/build/<preset>/ClashYuka.exe`，构建完成后 `clashyuka-service.exe` 会自动复制到 `ClashYuka.exe` 同级的 `resources/` 目录。
 
-- `clashyuka_tests`：数据模型/JSON、URL 编码、Mock HTTP（鉴权、PUT、错误、超时）、Mock WebSocket（收发、异常消息、主动断开、重连、析构清理）
-- `clashyuka_ui_tests`：主题/DPI/形状令牌、缓动函数端点与单调性、Bezier 插值、动画中途改目标、动画取消与 Handle 析构、多动画并行
-- `clashyuka_app_tests`：AppState 默认值/通知去重、观察者增删与通知期间订阅、AppController 导航/主题同步/消息转发、页面注册表顺序与查找
-- `clashyuka_process_tests`：进程启动、输出捕获、退出码、重复启动/停止、重启、非法路径
+运行前需将 Mihomo 内核（`mihomo.exe`）及 Geo 数据放入 `resources/` 目录，或通过设置页完成内核下载。
 
-真实内核验证不注册进 CTest（需要外部 mihomo）：
+测试（默认关闭）：
 
 ```powershell
-out\build\windows-x64\bin\Release\clashyuka_mihomo_integration.exe "C:\path\to\mihomo.exe"
+cmake --preset x64-release -DCLASHYUKA_BUILD_TESTS=ON
+cmake --build out/build/x64-release
 ```
 
-它会生成随机端口与随机 Secret 的临时配置，验证版本/代理组/节点切换/流量与日志 WebSocket/停止与无孤儿进程，结束后删除临时目录。
+集成测试可通过环境变量 `YUKA_TEST_MIHOMO` 指定 mihomo 可执行文件。
 
-Visual Studio 的测试资源管理器可以发现问题，但当前环境下 MCP `test_run` 返回失败且无诊断，测试以 `ctest` 命令行为准。
+## 运行时数据目录
 
-## wxWidgets 静态库（Windows）
+| 内容 | 路径 |
+| --- | --- |
+| 配置（`verge.yaml`、`profiles.yaml`、`clash-guard-overrides.yaml`） | `%APPDATA%\ClashYuka` |
+| 订阅、日志、缓存 | `%LOCALAPPDATA%\ClashYuka` |
+| 内核与 Geo 资源 | `<exe 目录>\resources` |
+| 开机自启注册表项 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ClashYuka` |
+| Windows 服务名 | `ClashYuka Service` |
+| TUN 设备名 | `YukaTun` |
 
-- `G:/Documents/wxwidgetsBuild`，库目录 `lib/vc_x64_lib`
-- 3.3.1，Unicode，x64，仅 Release 静态库，CRT `/MD`
-- 全配置统一 `/MD`，Debug 额外 `_ITERATOR_DEBUG_LEVEL=0`
-- 不要在 Debug 使用 `/MDd`
+## 许可
 
-个人路径与代理只写在 `CMakeUserPresets.json`（已 gitignore）：
-
-```json
-{
-  "configurePresets": [
-    {
-      "name": "windows-x64-release",
-      "inherits": "windows-cli-local"
-    }
-  ]
-}
-```
-
-## 第三方依赖
-
-| 依赖 | 版本 | 目标 |
-| --- | --- | --- |
-| cpp-httplib | v0.67.0 | `httplib::httplib` |
-| nlohmann/json | v3.12.0 | `nlohmann_json::nlohmann_json` |
-| yaml-cpp | 0.8.0 | `yaml-cpp::yaml-cpp` |
-| doctest | v2.5.3 | `doctest::doctest`（仅测试） |
-
-## 安全约定
-
-- 测试配置与 Secret 只在系统临时目录生成，测试结束删除。
-- Secret 由 `std::random_device` 生成，不写日志、不进 Git。
-- 真实内核测试只连接 `127.0.0.1`，随机端口，`allow-lan: false`。
-- 不修改用户现有订阅或配置。
-
-## 常见问题
-
-- **`WXWIDGETS_ROOT is not set`**：使用基于 `CMakeUserPresets.json` 的 `windows-x64-*` 或 `vs-windows-x64` 预设。
-- **`LNK2038`**：保持 `/MD` 与 `_ITERATOR_DEBUG_LEVEL=0`。
-- **Ninja `failed recompaction`**：CLI 与 VS 不要同时配置同一个 binaryDir；本项目已拆分目录。
-- **Real integration 启动失败**：确认 mihomo 二进制与 CPU 指令集兼容（`amd64-v3` 需要 AVX2）。
+本项目以 GNU General Public License v3.0 发布，详见 [LICENSE](LICENSE)。
