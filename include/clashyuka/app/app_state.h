@@ -158,6 +158,9 @@ public:
     void ResetLiveStreams();
     void PublishConnections(std::uint64_t generation, const mihomo::ConnectionsSnapshot& snapshot);
     void AppendLogs(std::uint64_t generation, const std::vector<mihomo::MihomoLogEntry>& batch);
+    // Application diagnostics. Unlike AppendLogs these also appear while the
+    // kernel is stopped, so a failed start or profile check is still readable.
+    void AppendAppLog(std::string type, std::string payload);
     void ClearLogs();
     bool RememberRedaction(std::string value);
     bool BeginConnectionClose(PendingConnectionClose request);

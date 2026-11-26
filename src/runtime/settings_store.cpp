@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "clashyuka/platform/platform_services.h"
+#include "clashyuka/runtime/runtime_config.h"
 
 namespace clashyuka::runtime {
 namespace {
@@ -72,6 +73,7 @@ core::Result<void> WriteSettingsFile(const fs::path& path, const AppSettings& se
     root["enableSystemProxy"] = settings.enableSystemProxy;
     root["closeToTray"] = settings.closeToTray;
     root["windowHotkey"] = settings.windowHotkey;
+    root["geoSourcePreset"] = settings.geoSourcePreset;
 
     {
         std::ofstream output(temp, std::ios::binary | std::ios::trunc);
@@ -245,6 +247,15 @@ SettingsLoadResult LoadSettings(const std::string& path) {
         }
     }
 
+    if (root.contains("geoSourcePreset")) {
+        std::string id;
+        if (ReadString(root, "geoSourcePreset", id) && FindGeoSourcePreset(id)) {
+            settings.geoSourcePreset = id;
+        } else {
+            partial = true;
+        }
+    }
+
     if (settings.secret.empty()) {
         settings.secret = GenerateLocalSecret();
         partial = true;
@@ -301,6 +312,9 @@ core::Result<void> ValidateSettings(const AppSettings& settings) {
     if (settings.proxyTestTimeoutMs < 1000 || settings.proxyTestTimeoutMs > 60000) {
         return MakeError(ErrorKind::InvalidConfig,
                          "the proxy delay timeout must be between 1000 and 60000 ms");
+    }
+    if (!FindGeoSourcePreset(settings.geoSourcePreset)) {
+        return MakeError(ErrorKind::InvalidConfig, "the Geo data download source is invalid");
     }
     if (!ParseWindowHotkey(settings.windowHotkey)) {
         return MakeError(ErrorKind::InvalidConfig, "the global window shortcut is invalid");

@@ -38,6 +38,12 @@ bool IsAutoGroup(const std::string& type) {
     return type == "URLTest" || type == "Fallback" || type == "LoadBalance";
 }
 
+// Keep groups visible even when a provider failed to load: an empty group is
+// more informative than a group that silently disappears.
+bool IsGroupType(const std::string& type) {
+    return IsSelector(type) || IsAutoGroup(type) || type == "Relay";
+}
+
 wxString GroupSummary(const std::string& type, const mihomo::ProxyInfo& group,
                       bool switching) {
     if (switching) {
@@ -163,7 +169,7 @@ void ProxiesPage::Rebuild(const std::shared_ptr<const runtime::ProxyCatalog>& ca
 
     std::vector<const mihomo::ProxyInfo*> groups;
     for (const mihomo::ProxyInfo& proxy : catalog->proxies) {
-        if (!proxy.all.empty()) {
+        if (IsGroupType(proxy.type) || !proxy.all.empty()) {
             groups.push_back(&proxy);
         }
     }
@@ -185,10 +191,10 @@ void ProxiesPage::Rebuild(const std::shared_ptr<const runtime::ProxyCatalog>& ca
         header->SetToolTip(wxString::FromUTF8(group->name));
         const std::string groupName = group->name;
         header->SetOnClick([this, groupName] {
-            if (expanded_.count(groupName) != 0) {
-                expanded_.erase(groupName);
+            if (collapsed_.count(groupName) != 0) {
+                collapsed_.erase(groupName);
             } else {
-                expanded_.insert(groupName);
+                collapsed_.insert(groupName);
             }
             ApplyFilter();
         });
@@ -306,7 +312,6 @@ void ProxiesPage::UpdateDynamic(const std::shared_ptr<const runtime::ProxyCatalo
             }
         }
     }
-
     if (!catalog->error.empty() && !pendingGroup_.empty()) {
         pendingGroup_.clear();
     }
@@ -320,10 +325,10 @@ void ProxiesPage::UpdateDynamic(const std::shared_ptr<const runtime::ProxyCatalo
         int nodes = 0;
         int groups = 0;
         for (const mihomo::ProxyInfo& proxy : catalog->proxies) {
-            if (proxy.all.empty()) {
-                ++nodes;
-            } else {
+            if (IsGroupType(proxy.type) || !proxy.all.empty()) {
                 ++groups;
+            } else {
+                ++nodes;
             }
         }
         wxString line = wxString::Format("%d groups", groups) + wxString::FromUTF8(" · ") +
@@ -375,12 +380,12 @@ void ProxiesPage::ApplyFilter() {
 
         if (group.nodesPanel != nullptr) {
             const bool showNodes =
-                expanded_.count(group.name) != 0 || (filtering && nodeMatch);
+                collapsed_.count(group.name) == 0 || (filtering && nodeMatch);
             group.nodesPanel->Show(visible && showNodes);
         }
     }
 
-    const bool empty = anyVisible || !anyGroups;
+    const bool empty = !anyVisible;
     emptyState_->Show(empty);
     if (empty) {
         emptyState_->SetText(anyGroups ? "No proxy groups or nodes match the search."

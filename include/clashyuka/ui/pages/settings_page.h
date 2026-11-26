@@ -4,6 +4,8 @@
 
 #include "clashyuka/ui/pages/page_base.h"
 
+class wxChoice;
+
 namespace clashyuka::ui {
 
 class Button;
@@ -52,6 +54,7 @@ private:
     SearchField* apiPortField_ = nullptr;
     SearchField* secretField_ = nullptr;
     Switch* autoStart_ = nullptr;
+    wxChoice* geoSourceChoice_ = nullptr;
     Switch* systemProxy_ = nullptr;
     TextBlock* systemProxyStatus_ = nullptr;
     Button* systemProxyRetry_ = nullptr;

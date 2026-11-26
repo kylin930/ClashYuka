@@ -149,6 +149,29 @@ TEST_CASE("live data scrubs secrets and remembers edited subscription URLs") {
     CHECK(row.chains == std::vector<std::string>{"[redacted]", "[redacted]"});
 }
 
+TEST_CASE("application diagnostics stay readable while the kernel is stopped") {
+    AppState state;
+    CHECK_FALSE(state.Get().live.logs);
+    CHECK(state.RememberRedaction("https://example.test/sub?token=hidden"));
+    state.AppendAppLog("error", "Profile rejected: failed to fetch https://example.test/sub?token=hidden");
+    REQUIRE(state.Get().live.logs);
+    CHECK(state.Get().live.logs->front().type == "error");
+    CHECK(state.Get().live.logs->front().payload == "Profile rejected: failed to fetch [redacted]");
+
+    runtime::KernelSnapshot kernel;
+    kernel.generation = 1;
+    kernel.phase = runtime::KernelPhase::Failed;
+    state.UpdateLiveStreams(kernel);
+    state.AppendAppLog("error", "Mihomo failed to start.");
+    REQUIRE(state.Get().live.logs);
+    CHECK(state.Get().live.logs->back().payload == "Mihomo failed to start.");
+
+    kernel.generation = 2;
+    kernel.phase = runtime::KernelPhase::Starting;
+    state.UpdateLiveStreams(kernel);
+    CHECK_FALSE(state.Get().live.logs);
+}
+
 TEST_CASE("live connection snapshots and close results are scoped to current requests") {
     AppState state;
     runtime::KernelSnapshot kernel;

@@ -258,6 +258,20 @@ void AppState::AppendLogs(std::uint64_t generation, const std::vector<mihomo::Mi
     Notify();
 }
 
+void AppState::AppendAppLog(std::string type, std::string payload) {
+    auto& live = snapshot_.live;
+    auto next = std::make_shared<std::vector<mihomo::MihomoLogEntry>>();
+    const auto retained = live.logs ? std::min(live.logs->size(), kLogLimit - 1) : 0;
+    next->reserve(retained + 1);
+    if (retained != 0) {
+        next->insert(next->end(), live.logs->end() - retained, live.logs->end());
+    }
+    next->push_back({LimitLogField(Redact(std::move(type)), kLogTypeBytes),
+                     LimitLogField(Redact(std::move(payload)), kLogPayloadBytes)});
+    live.logs = std::move(next);
+    Notify();
+}
+
 void AppState::ClearLogs() {
     if (snapshot_.live.logs) {
         snapshot_.live.logs.reset();

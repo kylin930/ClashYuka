@@ -35,6 +35,8 @@ struct AppSettings {
     bool closeToTray = false;
     // Empty disables the global window shortcut.
     std::string windowHotkey;
+
+    std::string geoSourcePreset = "profile";
 };
 
 struct WindowHotkey {

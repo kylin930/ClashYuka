@@ -351,6 +351,7 @@ runtime::KernelOptions AppController::BuildKernelOptions() const {
     options.mixedPort = settings_.mixedPort;
     options.secret = settings_.secret;
     options.logRedactions = state_.Redactions();
+    options.geoSourcePreset = settings_.geoSourcePreset;
     return options;
 }
 
@@ -540,6 +541,9 @@ void AppController::ActivateProfile(const std::string& id) {
     pendingProfileSwitch_ = kernel_->SwitchProfile(profile.Take());
     ProfileMessage(pendingProfileSwitch_ ? "Checking and applying profile..."
                                          : "The kernel is no longer ready to switch profiles.");
+    if (pendingProfileSwitch_) {
+        state_.AppendAppLog("info", "Checking profile " + id + " before applying it.");
+    }
 }
 
 void AppController::ConsumeProfileSwitch(const runtime::KernelSnapshot& snapshot) {
@@ -549,23 +553,42 @@ void AppController::ConsumeProfileSwitch(const runtime::KernelSnapshot& snapshot
     }
     pendingProfileSwitch_.reset();
     const auto& result = *snapshot.profileSwitchResult;
+    const auto logDiagnostics = [this, &result] {
+        for (const auto& line : result.diagnostics) {
+            state_.AppendAppLog("error", "[preflight] " + line);
+        }
+    };
     switch (result.outcome) {
         case runtime::ProfileSwitchOutcome::Succeeded:
             runningRevision_ = switchRevision_;
             PersistProfileSelection(result.newProfileId);
+            state_.AppendAppLog("info", "Profile applied: " + result.newProfileId);
             break;
         case runtime::ProfileSwitchOutcome::Rejected:
-            ProfileMessage(wxString::FromUTF8("Profile rejected: " + result.error.message));
+            if (result.error.kind == core::ErrorKind::Timeout) {
+                ProfileMessage("Profile check timed out. Check access to GeoIP/GeoSite downloads and try again.");
+                state_.AppendAppLog("error", "Profile check timed out.");
+            } else {
+                ProfileMessage(wxString::FromUTF8("Profile rejected: " + result.error.message));
+                state_.AppendAppLog("error", "Profile rejected: " + result.error.message);
+            }
+            logDiagnostics();
             break;
         case runtime::ProfileSwitchOutcome::RolledBack:
             ProfileMessage(wxString::FromUTF8("The previous profile was restored. Switch failed: " +
                                               result.error.message));
+            state_.AppendAppLog("warning", "The previous profile was restored after a failed switch: " +
+                                               result.error.message);
+            logDiagnostics();
             break;
         case runtime::ProfileSwitchOutcome::RollbackFailed:
             ProfileMessage("The new profile failed and Mihomo could not restore the previous one.");
+            state_.AppendAppLog("error", "The new profile failed and the previous kernel was lost.");
+            logDiagnostics();
             break;
         case runtime::ProfileSwitchOutcome::Cancelled:
             ProfileMessage("Profile switch cancelled.");
+            state_.AppendAppLog("info", "Profile switch cancelled.");
             break;
     }
 }
@@ -819,6 +842,7 @@ void AppController::OnKernelSnapshot(const runtime::KernelSnapshot& snapshot) {
                              static_cast<int>(snapshot.error.kind));
                 if (!friendly.empty()) {
                     ShowMessage(friendly);
+                    state_.AppendAppLog("error", friendly.utf8_string());
                 }
             }
             break;

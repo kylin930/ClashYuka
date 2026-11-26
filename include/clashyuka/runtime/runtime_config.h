@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -8,6 +9,31 @@
 #include "clashyuka/core/result.h"
 
 namespace clashyuka::runtime {
+
+struct GeoSourcePreset {
+    std::string_view id;
+    std::string_view label;
+    std::string_view baseUrl;
+};
+
+inline constexpr std::array kGeoSourcePresets{
+    GeoSourcePreset{"profile", "Use profile or Mihomo default", {}},
+    GeoSourcePreset{"metacubex-release", "MetaCubeX (GitHub Release)",
+                    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/"},
+    GeoSourcePreset{"metacubex-raw", "MetaCubeX (GitHub Raw)",
+                    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/"},
+    GeoSourcePreset{"metacubex-jsdelivr", "MetaCubeX (jsDelivr)",
+                    "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/"},
+};
+
+inline constexpr const GeoSourcePreset* FindGeoSourcePreset(std::string_view id) {
+    for (const auto& preset : kGeoSourcePresets) {
+        if (preset.id == id) {
+            return &preset;
+        }
+    }
+    return nullptr;
+}
 
 // Minimal, P2.2-only runtime configuration. It is written to the application
 // data directory and always binds the controller and proxy to loopback.
@@ -56,10 +82,10 @@ struct RuntimeConfigCopy {
 
 core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeProfileRuntimeCopy(
     const std::string& workingDirectory, std::string_view bytes,
-    const RuntimeConfigDefinition& definition);
+    const RuntimeConfigDefinition& definition, std::string_view geoSourcePreset = "profile");
 
 core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeLegacyRuntimeCopy(
     const std::string& workingDirectory, const std::string& configPath,
-    const RuntimeConfigDefinition& definition);
+    const RuntimeConfigDefinition& definition, std::string_view geoSourcePreset = "profile");
 
 }  // namespace clashyuka::runtime

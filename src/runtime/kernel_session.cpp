@@ -19,6 +19,7 @@ namespace fs = std::filesystem;
 
 constexpr int kShutdownWaitMs = 15000;
 constexpr std::size_t kRecentOutputLimit = 8;
+constexpr std::size_t kPreflightDiagnosticLimit = 20;
 constexpr std::size_t kPendingLogLimit = 500;
 constexpr std::size_t kLogPayloadBytes = 4096;
 
@@ -545,7 +546,8 @@ void KernelSession::HandleStart(std::uint64_t generation) {
 }
 
 core::Result<std::unique_ptr<KernelSession::LaunchConfig>> KernelSession::PrepareLaunch(
-    KernelOptions options, bool switching) {
+    KernelOptions options, bool switching, std::vector<std::string>* diagnostics) {
+    (void)switching;
     const bool imported = options.profile.yaml.has_value();
     if (options.profile.id.empty() || (options.profile.id == "builtin") == imported) {
         return core::MakeError(core::ErrorKind::ConfigFailed, "selected profile content is unavailable");
@@ -561,16 +563,18 @@ core::Result<std::unique_ptr<KernelSession::LaunchConfig>> KernelSession::Prepar
     }
     const RuntimeConfigDefinition definition{options.controllerHost, options.controllerPort,
                                              options.mixedPort, options.secret};
-    auto copy = imported ? MakeProfileRuntimeCopy(options.workingDirectory, *options.profile.yaml, definition)
-                         : MakeLegacyRuntimeCopy(options.workingDirectory, options.configPath, definition);
+    auto copy = imported ? MakeProfileRuntimeCopy(options.workingDirectory, *options.profile.yaml,
+                                                   definition, options.geoSourcePreset)
+                         : MakeLegacyRuntimeCopy(options.workingDirectory, options.configPath,
+                                                  definition, options.geoSourcePreset);
     if (!copy) {
         return copy.error();
     }
     options.profile.yaml.reset();
     auto config = std::make_unique<LaunchConfig>(
         LaunchConfig{std::move(options), std::move(copy.value()), imported});
-    if (imported || switching) {
-        const auto checked = Preflight(*config);
+    if (options.preflight && (imported || switching)) {
+        const auto checked = Preflight(*config, diagnostics);
         if (!checked) {
             return checked.error();
         }
@@ -578,17 +582,67 @@ core::Result<std::unique_ptr<KernelSession::LaunchConfig>> KernelSession::Prepar
     return config;
 }
 
-core::Result<void> KernelSession::Preflight(const LaunchConfig& config) {
+void KernelSession::AppendRuntimeLog(std::uint64_t generation, std::string type,
+                                     std::string_view line) {
+    if (line.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->generation != generation) {
+            return;
+        }
+        if (state_->logs.size() == kPendingLogLimit) {
+            state_->logs.pop_front();
+        }
+        state_->logs.push_back(
+            {SanitizeLogField(type, state_->logRedactions, state_->apiConfig.secret, 32),
+             SanitizeLogField(line, state_->logRedactions, state_->apiConfig.secret,
+                              kLogPayloadBytes)});
+    }
+    DispatchStreams(state_, dispatcher_, generation);
+}
+
+core::Result<void> KernelSession::Preflight(const LaunchConfig& config,
+                                            std::vector<std::string>* diagnostics) {
     using namespace std::chrono;
-    const auto deadline = steady_clock::now() +
-                          milliseconds(std::clamp(config.options.preflightTimeoutMs, 1, 15000));
+    const int limitMs = std::clamp(config.options.preflightTimeoutMs, 1, 60000);
+    const auto deadline = steady_clock::now() + milliseconds(limitMs);
+    std::mutex captureMutex;
+    std::vector<std::string> captured;
+    const auto capture = [&](std::string_view line) {
+        if (line.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(captureMutex);
+        if (captured.size() == kPreflightDiagnosticLimit) {
+            captured.erase(captured.begin());
+        }
+        captured.emplace_back(line.substr(0, 300));
+    };
+    // Runs after the process is stopped so the reader threads no longer touch captured.
+    const auto collect = [&](std::string summary) {
+        std::lock_guard<std::mutex> lock(captureMutex);
+        if (diagnostics == nullptr) {
+            return;
+        }
+        diagnostics->push_back(std::move(summary));
+        for (const auto& line : captured) {
+            diagnostics->push_back(SanitizeLogField(line, config.options.logRedactions,
+                                                    config.options.secret, 300));
+        }
+        captured.clear();
+    };
     auto process = drivers_->CreateProcess();
     if (Cancelled()) {
         return core::MakeError(core::ErrorKind::Cancelled, "profile preflight was cancelled");
     }
+    mihomo::MihomoProcessHandlers handlers;
+    handlers.onStdoutLine = capture;
+    handlers.onStderrLine = capture;
     if (!process || !process->Start({config.options.executablePath,
                                     {"-t", "-d", config.copy->workingDirectory,
-                                     "-f", config.copy->configPath}}, {})) {
+                                     "-f", config.copy->configPath}}, handlers)) {
         return core::MakeError(core::ErrorKind::StartFailed, "could not start Mihomo profile preflight");
     }
     while (!Cancelled() && steady_clock::now() < deadline) {
@@ -597,15 +651,19 @@ core::Result<void> KernelSession::Preflight(const LaunchConfig& config) {
             if (*code == 0) {
                 return {};
             }
+            collect("Mihomo exited with code " + std::to_string(*code) + " during the profile check.");
             return core::MakeError(core::ErrorKind::ProfilePreflightRejected,
                                    "Mihomo rejected the profile configuration");
         }
         InterruptibleSleep(10);
     }
     process->Stop();
-    return Cancelled()
-        ? core::MakeError(core::ErrorKind::Cancelled, "profile preflight was cancelled")
-        : core::MakeError(core::ErrorKind::Timeout, "Mihomo profile preflight timed out");
+    if (Cancelled()) {
+        collect("The profile check was cancelled.");
+        return core::MakeError(core::ErrorKind::Cancelled, "profile preflight was cancelled");
+    }
+    collect("The profile check did not finish within " + std::to_string(limitMs) + " ms.");
+    return core::MakeError(core::ErrorKind::Timeout, "Mihomo profile preflight timed out");
 }
 
 core::Result<void> KernelSession::Launch(std::uint64_t generation, const LaunchConfig& config,
@@ -653,18 +711,25 @@ core::Result<void> KernelSession::Launch(std::uint64_t generation, const LaunchC
     launch.arguments = {"-d", config.copy->workingDirectory, "-f", config.copy->configPath};
 
     mihomo::MihomoProcessHandlers handlers;
-    if (!config.imported) {
-        handlers.onStdoutLine = [this](std::string_view line) {
+    handlers.onStdoutLine = [this, generation, imported = config.imported](std::string_view line) {
+        if (line.empty()) {
+            return;
+        }
+        if (!imported) {
+            // Legacy diagnostics stay available for start error messages.
             std::lock_guard<std::mutex> lock(outputMutex_);
-            if (!line.empty()) {
-                recentOutput_.emplace_back(line.substr(0, 300));
-                if (recentOutput_.size() > kRecentOutputLimit) {
-                    recentOutput_.pop_front();
-                }
+            recentOutput_.emplace_back(line.substr(0, 300));
+            if (recentOutput_.size() > kRecentOutputLimit) {
+                recentOutput_.pop_front();
             }
-        };
-        handlers.onStderrLine = handlers.onStdoutLine;
-    }
+        }
+        const std::string_view text(line.substr(0, 400));
+        const std::string type = text.find("level=error") != std::string_view::npos   ? "error"
+                                 : text.find("level=warn") != std::string_view::npos  ? "warning"
+                                                                                     : "info";
+        AppendRuntimeLog(generation, type, line);
+    };
+    handlers.onStderrLine = handlers.onStdoutLine;
     handlers.onExited = [this, generation, status](int exitCode) {
         status->exitCode.store(exitCode);
         status->exited.store(true);
@@ -920,7 +985,7 @@ void KernelSession::HandleProfileSwitch(Command command) {
 
     auto candidate = [&]() -> core::Result<std::unique_ptr<LaunchConfig>> {
         try {
-            return PrepareLaunch(std::move(command.options), true);
+            return PrepareLaunch(std::move(command.options), true, &result.diagnostics);
         } catch (...) {
             return core::MakeError(core::ErrorKind::Internal, "could not prepare the profile runtime copy");
         }

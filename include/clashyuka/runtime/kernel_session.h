@@ -48,6 +48,8 @@ struct ProfileSwitchResult {
     std::string newProfileId;
     ProfileSwitchOutcome outcome = ProfileSwitchOutcome::Cancelled;
     core::Error error;
+    // Sanitized `mihomo -t` output explaining a failed check. Empty on success.
+    std::vector<std::string> diagnostics;
 };
 
 enum class StreamAvailability { Waiting, Available, Disconnected, Disabled };
@@ -95,10 +97,14 @@ struct KernelOptions {
     bool connectTraffic = true;
     bool connectConnections = true;
     KernelProfile profile;
-    int preflightTimeoutMs = 5000;
+    // Opt-in `mihomo -t`. The default matches the reference client: start the
+    // kernel directly so cached data is reused and no network probe blocks a switch.
+    bool preflight = false;
+    int preflightTimeoutMs = 30000;
     bool connectLogs = true;
     // Known subscription URLs (controller secret is included automatically).
     std::vector<std::string> logRedactions;
+    std::string geoSourcePreset = "profile";
 };
 
 struct KernelSnapshot {
@@ -247,8 +253,11 @@ private:
     void HandleProcessExited(std::uint64_t generation);
     void HandleProfileSwitch(Command command);
     void FinishProfileSwitch(ProfileSwitchResult result);
-    core::Result<std::unique_ptr<LaunchConfig>> PrepareLaunch(KernelOptions options, bool switching);
-    core::Result<void> Preflight(const LaunchConfig& config);
+    core::Result<std::unique_ptr<LaunchConfig>> PrepareLaunch(
+        KernelOptions options, bool switching, std::vector<std::string>* diagnostics = nullptr);
+    core::Result<void> Preflight(const LaunchConfig& config,
+                                 std::vector<std::string>* diagnostics = nullptr);
+    void AppendRuntimeLog(std::uint64_t generation, std::string type, std::string_view line);
     core::Result<void> Launch(std::uint64_t generation, const LaunchConfig& config,
                               ProfileSwitchResult* readyResult = nullptr);
     void HandleShutdown();

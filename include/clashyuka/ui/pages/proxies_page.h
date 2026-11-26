@@ -62,7 +62,8 @@ private:
     std::vector<GroupView> groups_;
     std::map<std::string, ListItem*> nodeItems_;
     std::map<std::string, wxWindow*> nodeRows_;
-    std::set<std::string> expanded_;
+    // Groups render their members by default; only explicit collapses are remembered.
+    std::set<std::string> collapsed_;
     std::string pendingGroup_;
     std::uint64_t builtRevision_ = 0;
     wxString filter_;

@@ -129,6 +129,31 @@ TEST_CASE("settings round trip through JSON") {
     CHECK(loaded.settings.secret == settings.secret);
 }
 
+TEST_CASE("Geo download source persists by ID and invalid stored IDs only reset that field") {
+    TempDir dir;
+    const auto file = dir.path / "settings.json";
+    const auto path = ToUtf8(file);
+    auto settings = runtime::DefaultSettings();
+    settings.controllerPort = 19001;
+    for (const auto& preset : runtime::kGeoSourcePresets) {
+        settings.geoSourcePreset = preset.id;
+        REQUIRE(runtime::SaveSettings(path, settings).ok());
+        CHECK(runtime::LoadSettings(path).settings.geoSourcePreset == preset.id);
+    }
+    auto root = nlohmann::json::parse(ReadFile(file));
+    root.erase("geoSourcePreset");
+    WriteFile(file, root.dump());
+    CHECK(runtime::LoadSettings(path).settings.geoSourcePreset == "profile");
+    for (const auto& invalid : {nlohmann::json("unknown"), nlohmann::json(42)}) {
+        root["geoSourcePreset"] = invalid;
+        WriteFile(file, root.dump());
+        const auto loaded = runtime::LoadSettings(path);
+        CHECK(loaded.settings.geoSourcePreset == "profile");
+        CHECK(loaded.settings.controllerPort == 19001);
+        CHECK(loaded.settings.secret == settings.secret);
+    }
+}
+
 TEST_CASE("desktop settings round trip and invalid shortcuts preserve saved preferences") {
     TempDir dir;
     const auto path = ToUtf8(dir.path / "settings.json");
@@ -395,7 +420,11 @@ struct FakeKernel {
     std::atomic<int> preflightStops{0};
     std::atomic<int> preflightCode{0}; // Negative simulates a hung check.
     std::atomic<bool> capturedImportedOutput{false};
+    std::atomic<bool> preflightHandlers{false};
+    std::string preflightOutput;
+    std::string launchOutput;
     std::vector<std::string> liveConfigs;
+    std::vector<std::string> preflightArguments;
     std::atomic<int> apiCalls{0};
     std::atomic<int> trafficConnects{0};
     std::atomic<int> connectionConnects{0};
@@ -492,15 +521,38 @@ public:
                mihomo::MihomoProcessHandlers handlers) override {
         preflight_ = !options.arguments.empty() && options.arguments[0] == "-t";
         if (preflight_) {
+            {
+                std::lock_guard lock(fake_->mutex);
+                fake_->preflightArguments = options.arguments;
+            }
             fake_->preflightStarts.fetch_add(1);
-            code_ = fake_->preflightCode.load();
             if (handlers.onStdoutLine || handlers.onStderrLine) {
-                fake_->capturedImportedOutput.store(true);
+                fake_->preflightHandlers.store(true);
+            }
+            std::string output;
+            {
+                std::lock_guard lock(fake_->mutex);
+                output = fake_->preflightOutput;
+            }
+            if (handlers.onStderrLine && !output.empty()) {
+                std::size_t start = 0;
+                while (start <= output.size()) {
+                    const auto end = output.find('\n', start);
+                    handlers.onStderrLine(
+                        std::string_view(output).substr(start, end == std::string::npos
+                                                                   ? std::string::npos
+                                                                   : end - start));
+                    if (end == std::string::npos) {
+                        break;
+                    }
+                    start = end + 1;
+                }
             }
             return true;
         }
         bool result = true;
         int exitCode = -1;
+        std::string output;
         {
             std::lock_guard<std::mutex> lock(fake_->mutex);
             fake_->processStarts.fetch_add(1);
@@ -515,6 +567,19 @@ public:
             fake_->running = result;
             fake_->exitHandler = handlers.onExited;
             exitCode = fake_->exitAfterStartCode;
+            output = fake_->launchOutput;
+        }
+        if (handlers.onStdoutLine && !output.empty()) {
+            std::size_t start = 0;
+            while (start <= output.size()) {
+                const auto end = output.find('\n', start);
+                handlers.onStdoutLine(std::string_view(output).substr(
+                    start, end == std::string::npos ? std::string::npos : end - start));
+                if (end == std::string::npos) {
+                    break;
+                }
+                start = end + 1;
+            }
         }
         if (result && exitCode >= 0 && handlers.onExited) {
             handlers.onExited(exitCode);
@@ -539,13 +604,13 @@ public:
     }
 
     std::optional<int> ExitCode() const override {
-        return preflight_ && code_ >= 0 ? std::optional<int>{code_} : std::nullopt;
+        const int code = fake_->preflightCode.load();
+        return preflight_ && code >= 0 ? std::optional<int>{code} : std::nullopt;
     }
 
 private:
     std::shared_ptr<FakeKernel> fake_;
     bool preflight_ = false;
-    int code_ = -1;
 };
 
 class FakeApiDriver final : public runtime::KernelApiDriver {
@@ -1292,7 +1357,7 @@ TEST_CASE("single connection close is serialized and its result is guarded") {
     CHECK_FALSE(harness.session->CloseConnection(harness.observer.Last().generation, "active"));
 }
 
-TEST_CASE("imported copies isolate ingress and preserve group behavior") {
+TEST_CASE("imported copies keep subscription settings and enforce managed fields") {
     TempDir dir;
     const std::string original = R"(allow-lan: true
 bind-address: '*'
@@ -1327,28 +1392,111 @@ rules: ['MATCH,Pick']
     REQUIRE(second.ok());
     const auto path = FromUtf8(first.value()->configPath);
     CHECK(first.value()->configPath != second.value()->configPath);
-    CHECK(path.parent_path() == FromUtf8(first.value()->workingDirectory));
+    CHECK(first.value()->workingDirectory == second.value()->workingDirectory);
+    CHECK(path.parent_path().parent_path() ==
+          FromUtf8(first.value()->workingDirectory) / "session-copies");
     const auto contents = ReadFile(path);
     const auto root = YAML::Load(contents);
-    for (const auto* key : {"port", "socks-port", "redir-port", "tproxy-port", "listeners", "tun",
-                             "external-controller-tls", "external-controller-unix",
+    for (const auto* key : {"tun", "external-controller-tls", "external-controller-unix",
                              "external-controller-pipe", "external-controller-cors"}) {
         CHECK_FALSE(root[key]);
     }
+    CHECK(root["port"].as<int>() == 2);
+    CHECK(root["socks-port"].as<int>() == 3);
+    CHECK(root["redir-port"].as<int>() == 4);
+    CHECK(root["tproxy-port"].as<int>() == 5);
+    CHECK(root["listeners"][0]["port"].as<int>() == 6);
     CHECK_FALSE(root["allow-lan"].as<bool>());
     CHECK(root["bind-address"].Scalar() == "127.0.0.1");
     CHECK(root["external-controller"].Scalar() == "127.0.0.1:9090");
     CHECK(root["mixed-port"].as<int>() == 7897);
     CHECK(root["secret"].Scalar() == "app-secret");
-    CHECK_FALSE(root["dns"]["listen"]);
+    CHECK(root["dns"]["listen"].Scalar() == "0.0.0.0:53");
     CHECK(root["dns"]["enable"].as<bool>());
-    CHECK_FALSE(root["proxy-providers"]["remote"]["path"]);
+    CHECK(root["proxy-providers"]["remote"]["path"].Scalar() == "configs/source.yaml");
     CHECK(root["proxy-groups"][0]["type"].Scalar() == "url-test");
     CHECK(root["proxy-groups"][0]["use"][0].Scalar() == "remote");
     CHECK(root["rules"][0].Scalar() == "MATCH,Pick");
     CHECK(ReadFile(source) == original);
     first.value().reset();
     CHECK_FALSE(fs::exists(path));
+}
+
+TEST_CASE("Geo source presets override only the four URLs in both runtime copies") {
+    TempDir dir;
+    const auto home = ToUtf8(dir.path);
+    const auto source = dir.path / "source.yaml";
+    const auto cache = dir.path / "GeoIP.dat";
+    const std::string original = "# keep this file intact\nexternal-controller: '127.0.0.1:9090'\n"
+        "geox-url: {geoip: 'https://example.test/geoip', future: 'https://example.test/future'}\n"
+        "geo-auto-update: false\nrules: ['MATCH,DIRECT']\n";
+    WriteFile(source, original);
+    WriteFile(cache, "existing cache");
+    for (const auto& preset : runtime::kGeoSourcePresets) {
+        auto local = MakeLegacyRuntimeCopy(home, ToUtf8(source), {}, preset.id);
+        auto imported = MakeProfileRuntimeCopy(home, original, {}, preset.id);
+        REQUIRE(local.ok());
+        REQUIRE(imported.ok());
+        const auto localBytes = ReadFile(FromUtf8(local.value()->configPath));
+        if (preset.baseUrl.empty()) {
+            CHECK(localBytes == original);
+        }
+        for (const auto& bytes : {localBytes, ReadFile(FromUtf8(imported.value()->configPath))}) {
+            const auto root = YAML::Load(bytes);
+            const auto urls = root["geox-url"];
+            CHECK_FALSE(root["geo-auto-update"].as<bool>());
+            CHECK(root["rules"][0].Scalar() == "MATCH,DIRECT");
+            CHECK(urls["future"].Scalar() == "https://example.test/future");
+            const std::string base(preset.baseUrl);
+            if (base.empty()) {
+                CHECK(urls["geoip"].Scalar() == "https://example.test/geoip");
+                CHECK_FALSE(urls["geosite"]);
+            } else {
+                CHECK(urls["geoip"].Scalar() == base + "geoip.dat");
+                CHECK(urls["geosite"].Scalar() == base + "geosite.dat");
+                CHECK(urls["mmdb"].Scalar() == base + "geoip.metadb");
+                CHECK(urls["asn"].Scalar() == base + "GeoLite2-ASN.mmdb");
+            }
+        }
+    }
+    CHECK(ReadFile(source) == original);
+    CHECK(ReadFile(cache) == "existing cache");
+    auto generated = MakeLegacyRuntimeCopy(home, ToUtf8(dir.path / "generated.yaml"), {}, "metacubex-raw");
+    REQUIRE(generated.ok());
+    CHECK(ReadFile(dir.path / "generated.yaml").find("geox-url") == std::string::npos);
+}
+
+TEST_CASE("profile copies keep unrecognized keys and disable Geo downloads") {
+    TempDir dir;
+    const auto home = ToUtf8(dir.path);
+    const std::string yamlText = R"(geodata-mode: true
+geo-auto-update: true
+tunnels: [{network: tcp, address: 127.0.0.1:9000, target: 127.0.0.1:9001}]
+future-root-key: {enabled: true}
+rules: ['MATCH,DIRECT']
+)";
+    auto copy = MakeProfileRuntimeCopy(home, yamlText, {});
+    REQUIRE(copy.ok());
+    const auto root = YAML::Load(ReadFile(FromUtf8(copy.value()->configPath)));
+    CHECK_FALSE(root["geodata-mode"].as<bool>());
+    CHECK_FALSE(root["geo-auto-update"].as<bool>());
+    CHECK(root["tunnels"][0]["address"].Scalar() == "127.0.0.1:9000");
+    CHECK(root["future-root-key"]["enabled"].as<bool>());
+}
+
+TEST_CASE("copies share one persistent working directory and leave it intact") {
+    TempDir dir;
+    const auto home = ToUtf8(dir.path / "配置");
+    auto first = MakeProfileRuntimeCopy(home, "rules: ['MATCH,DIRECT']\n", {});
+    REQUIRE(first.ok());
+    const auto workingDirectory = FromUtf8(first.value()->workingDirectory);
+    WriteFile(workingDirectory / "GeoIP.dat", "cached data");
+    const auto cache = workingDirectory / "session-copies" / "cached";
+    WriteFile(cache, "provider cache");
+    first.value().reset();
+    CHECK(fs::exists(workingDirectory / "GeoIP.dat"));
+    CHECK(fs::exists(cache));
+    CHECK_FALSE(fs::exists(workingDirectory / "config.yaml"));
 }
 
 TEST_CASE("runtime isolation rejects dependencies without disclosing paths") {
@@ -1387,6 +1535,8 @@ std::optional<ProfileSwitchResult> WaitSwitch(Harness& harness, std::uint64_t re
 TEST_CASE("first imported startup preflights its own copy before publishing readiness") {
     Harness harness;
     auto options = harness.Options();
+    options.preflight = true;
+    options.geoSourcePreset = "metacubex-raw";
     options.profile = {"local-one", "rules: ['MATCH,DIRECT']\nsecret: never-log-this"};
     harness.SetOptions(options);
     harness.fake->ConfigureApiFailures(1, 30);
@@ -1395,6 +1545,15 @@ TEST_CASE("first imported startup preflights its own copy before publishing read
     CHECK(harness.observer.Last().runningProfileId.empty());
     REQUIRE(harness.WaitPhase(KernelPhase::Running));
     CHECK(harness.observer.Last().runningProfileId == "local-one");
+    {
+        std::lock_guard lock(harness.fake->mutex);
+        const auto& args = harness.fake->preflightArguments;
+        REQUIRE(args.size() == 5);
+        CHECK(args.front() == "-t");
+        CHECK(std::vector<std::string>(args.begin() + 1, args.end()) == harness.fake->lastLaunch.arguments);
+        REQUIRE(harness.fake->liveConfigs.size() == 1);
+        CHECK(harness.fake->liveConfigs.front().find("https://raw.githubusercontent.com/") != std::string::npos);
+    }
     CHECK(harness.fake->preflightStarts == 1);
     CHECK(harness.fake->preflightStops == 1);
     CHECK(harness.fake->processStarts == 1);
@@ -1405,6 +1564,7 @@ TEST_CASE("first imported startup preflights its own copy before publishing read
 TEST_CASE("first imported startup distinguishes preflight rejection from runtime copy failure") {
     Harness harness;
     auto options = harness.Options();
+    options.preflight = true;
     options.profile = {"local-one", "rules: ['MATCH,DIRECT']\nsecret: profile-marker"};
     harness.SetOptions(options);
 
@@ -1449,6 +1609,7 @@ TEST_CASE("unavailable selected profile cannot fall back to a legacy config") {
 TEST_CASE("failed or timed-out preflight keeps the exact old session running") {
     Harness harness;
     auto options = harness.Options();
+    options.preflight = true;
     options.preflightTimeoutMs = 35;
     harness.SetOptions(options);
     harness.session->Start();
@@ -1471,6 +1632,117 @@ TEST_CASE("failed or timed-out preflight keeps the exact old session running") {
         CHECK(harness.fake->processStops == 0);
     }
     CHECK(harness.fake->preflightStops == 2);
+}
+
+TEST_CASE("switch preflight can finish after the former five-second limit") {
+    Harness harness;
+    auto options = harness.Options();
+    options.preflight = true;
+    harness.SetOptions(options);
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    harness.fake->preflightCode = -1;
+    const auto request = harness.session->SwitchProfile({"new", "{}"});
+    REQUIRE(request);
+    REQUIRE(WaitUntil([&] { return harness.fake->preflightStarts == 1; }));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+    CHECK(harness.observer.Last().profileSwitchInProgress);
+    CHECK(harness.observer.Last().runningProfileId == "builtin");
+    CHECK(harness.fake->processStops == 0);
+
+    harness.fake->preflightCode = 0;
+    const auto result = WaitSwitch(harness, *request);
+    REQUIRE(result);
+    CHECK(result->outcome == ProfileSwitchOutcome::Succeeded);
+    CHECK(harness.observer.Last().runningProfileId == "new");
+}
+
+TEST_CASE("imported kernel output reaches the log stream without a preflight") {
+    Harness harness;
+    auto options = harness.Options();
+    options.profile = {"local-one", "rules: ['MATCH,DIRECT']"};
+    options.logRedactions = {"https://example.test/sub?token=hidden"};
+    {
+        std::lock_guard lock(harness.fake->mutex);
+        harness.fake->launchOutput =
+            "time=\"2026-01-01T00:00:00Z\" level=info msg=\"provider https://example.test/sub?token=hidden loaded\"\n"
+            "time=\"2026-01-01T00:00:01Z\" level=error msg=\"unsupported proxy type: fixture\"";
+    }
+    harness.SetOptions(options);
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    CHECK(harness.fake->preflightStarts == 0);
+    REQUIRE(WaitUntil([&] {
+        std::lock_guard lock(harness.observer.mutex);
+        return !harness.observer.logBatches.empty();
+    }));
+    std::vector<mihomo::MihomoLogEntry> entries;
+    {
+        std::lock_guard lock(harness.observer.mutex);
+        for (const auto& batch : harness.observer.logBatches) {
+            entries.insert(entries.end(), batch.begin(), batch.end());
+        }
+    }
+    REQUIRE(entries.size() >= 2);
+    CHECK(entries[0].type == "info");
+    CHECK(entries[0].payload.find("token=hidden") == std::string::npos);
+    CHECK(entries[0].payload.find("[redacted]") != std::string::npos);
+    CHECK(entries[1].type == "error");
+    CHECK(entries[1].payload.find("unsupported proxy type") != std::string::npos);
+}
+
+TEST_CASE("failed preflight reports sanitized diagnostics for the log view") {
+    Harness harness;
+    auto options = harness.Options();
+    options.preflight = true;
+    options.logRedactions = {"https://example.test/sub?token=hidden"};
+    harness.SetOptions(options);
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    harness.fake->preflightCode = 7;
+    {
+        std::lock_guard lock(harness.fake->mutex);
+        harness.fake->preflightOutput =
+            "can't download GeoIP.dat from https://example.test/sub?token=hidden\n"
+            "unsupported proxy type: fixture-protocol";
+    }
+    const auto request = harness.session->SwitchProfile({"new", "{}"});
+    REQUIRE(request);
+    const auto result = WaitSwitch(harness, *request);
+    REQUIRE(result);
+    CHECK(result->outcome == ProfileSwitchOutcome::Rejected);
+    CHECK(harness.fake->preflightHandlers.load());
+    REQUIRE(result->diagnostics.size() == 3);
+    CHECK(result->diagnostics[0] == "Mihomo exited with code 7 during the profile check.");
+    CHECK(result->diagnostics[1].find("token=hidden") == std::string::npos);
+    CHECK(result->diagnostics[1].find("[redacted]") != std::string::npos);
+    CHECK(result->diagnostics[2] == "unsupported proxy type: fixture-protocol");
+    CHECK(harness.observer.Last().runningProfileId == "builtin");
+}
+
+TEST_CASE("timed-out preflight explains the deadline in its diagnostics") {
+    Harness harness;
+    auto options = harness.Options();
+    options.preflight = true;
+    options.preflightTimeoutMs = 35;
+    harness.SetOptions(options);
+    harness.session->Start();
+    REQUIRE(harness.WaitPhase(KernelPhase::Running));
+    harness.fake->preflightCode = -1;
+    {
+        std::lock_guard lock(harness.fake->mutex);
+        harness.fake->preflightOutput = "level=info msg=\"Start initial configuration in progress\"";
+    }
+    const auto request = harness.session->SwitchProfile({"new", "{}"});
+    REQUIRE(request);
+    const auto result = WaitSwitch(harness, *request);
+    REQUIRE(result);
+    CHECK(result->outcome == ProfileSwitchOutcome::Rejected);
+    CHECK(result->error.kind == core::ErrorKind::Timeout);
+    REQUIRE(result->diagnostics.size() == 2);
+    CHECK(result->diagnostics[0] == "The profile check did not finish within 35 ms.");
+    CHECK(result->diagnostics[1].find("Start initial configuration") != std::string::npos);
 }
 
 TEST_CASE("switch success is tokenized and stale old process callbacks cannot undo it") {
@@ -1519,6 +1791,8 @@ TEST_CASE("candidate readiness failure rolls back exact bytes or reports rollbac
     SUBCASE("restore succeeds") { rollbackFails = false; }
     SUBCASE("restore fails") { rollbackFails = true; }
     harness.fake->ConfigureApiFailures(rollbackFails ? 2 : 1, 0);
+    options.geoSourcePreset = "metacubex-jsdelivr";
+    harness.SetOptions(options);
     const auto request = harness.session->SwitchProfile({"new", "rules: ['MATCH,DIRECT']"});
     REQUIRE(request);
     const auto result = WaitSwitch(harness, *request);
@@ -1534,6 +1808,7 @@ TEST_CASE("candidate readiness failure rolls back exact bytes or reports rollbac
     {
         std::lock_guard lock(harness.fake->mutex);
         REQUIRE(harness.fake->liveConfigs.size() == 3);
+        CHECK(harness.fake->liveConfigs[1].find("https://cdn.jsdelivr.net/") != std::string::npos);
         CHECK(harness.fake->liveConfigs[2] == harness.fake->liveConfigs[0]);
         CHECK(harness.fake->liveConfigs[2] == old);
     }
@@ -1541,6 +1816,9 @@ TEST_CASE("candidate readiness failure rolls back exact bytes or reports rollbac
 
 TEST_CASE("Stop cancels a pending preflight and does not launch a candidate") {
     Harness harness;
+    auto options = harness.Options();
+    options.preflight = true;
+    harness.SetOptions(options);
     harness.session->Start();
     REQUIRE(harness.WaitPhase(KernelPhase::Running));
     harness.fake->preflightCode = -1;
@@ -1560,6 +1838,9 @@ TEST_CASE("Stop cancels a pending preflight and does not launch a candidate") {
 
 TEST_CASE("shutdown discards a pending switch without publishing late results") {
     Harness harness;
+    auto options = harness.Options();
+    options.preflight = true;
+    harness.SetOptions(options);
     harness.session->Start();
     REQUIRE(harness.WaitPhase(KernelPhase::Running));
     harness.fake->preflightCode = -1;

@@ -300,11 +300,15 @@ namespace {
 
 core::Result<std::unique_ptr<RuntimeConfigCopy>> CreateCopy(
     const std::string& workingDirectory, std::string_view bytes,
-    RuntimeConfigInfo info, bool isolateHome) {
+    RuntimeConfigInfo info) {
     std::error_code error;
     const auto home = fs::absolute(PathFromUtf8(workingDirectory), error);
     if (error) {
         return MakeError(ErrorKind::ConfigFailed, "could not resolve the runtime directory");
+    }
+    fs::create_directories(home, error);
+    if (error) {
+        return MakeError(ErrorKind::ConfigFailed, "could not create the runtime directory");
     }
     const auto parent = home / "session-copies";
     fs::create_directories(parent, error);
@@ -328,7 +332,9 @@ core::Result<std::unique_ptr<RuntimeConfigCopy>> CreateCopy(
             break;
         }
 #endif
-        copy->workingDirectory = ToUtf8(isolateHome ? path : home);
+        // The kernel keeps one persistent -d directory so Geo/provider caches
+        // survive profile switches; only the config file stays per-session.
+        copy->workingDirectory = ToUtf8(home);
         copy->configPath = ToUtf8(path / "config.yaml");
         copy->info = std::move(info);
         const auto written = WriteConfigFile(copy->configPath, std::string(bytes));
@@ -340,17 +346,36 @@ core::Result<std::unique_ptr<RuntimeConfigCopy>> CreateCopy(
     return MakeError(ErrorKind::ConfigFailed, "could not create a private runtime copy");
 }
 
-// Keep routing and outbound configuration. Unrecognized root settings are never
-// forwarded to the kernel: new Mihomo versions may add more privileged inputs.
-bool IsProfileSetting(std::string_view key) {
-    for (const std::string_view allowed : {
-             "proxies", "proxy-groups", "proxy-providers", "rule-providers", "rules",
-             "sub-rules", "mode", "log-level", "ipv6", "dns", "hosts", "sniffer",
-             "profile", "unified-delay", "tcp-concurrent", "find-process-mode",
-             "global-client-fingerprint", "global-ua", "etag-support", "geodata-mode",
-             "geodata-loader", "geox-url", "geo-auto-update", "geo-update-interval",
-             "keep-alive-interval", "keep-alive-idle", "disable-keep-alive"}) {
-        if (key == allowed) {
+core::Result<void> ApplyGeoSource(YAML::Node& root, const GeoSourcePreset& preset) {
+    if (preset.baseUrl.empty()) {
+        return {};
+    }
+    auto urls = static_cast<const YAML::Node&>(root)["geox-url"];
+    if (!urls || urls.IsNull()) {
+        root["geox-url"] = YAML::Node(YAML::NodeType::Map);
+    } else if (!urls.IsMap()) {
+        return MakeError(ErrorKind::ConfigFailed, "geox-url must be a mapping to apply a Geo source");
+    }
+    auto target = root["geox-url"];
+    const std::string base(preset.baseUrl);
+    target["geoip"] = base + "geoip.dat";
+    target["geosite"] = base + "geosite.dat";
+    target["mmdb"] = base + "geoip.metadb";
+    target["asn"] = base + "GeoLite2-ASN.mmdb";
+    return {};
+}
+
+// Mirrors the reference client: only fields the application owns are removed so
+// subscription content (ports, listeners, provider caches, newer keys) survives.
+// TUN is intentionally out of scope and stays stripped; binding is pinned to
+// loopback because ClashYuka only exposes the mixed port.
+bool IsManagedSetting(std::string_view key) {
+    for (const std::string_view managed : {
+             "external-controller", "external-controller-tls", "external-controller-unix",
+             "external-controller-pipe", "external-controller-cors", "secret",
+             "external-ui", "external-ui-name", "external-ui-url", "bind-address",
+             "mixed-port", "allow-lan", "tun"}) {
+        if (key == managed) {
             return true;
         }
     }
@@ -385,7 +410,11 @@ bool HasLocalProxyDependency(const YAML::Node& proxies) {
 
 core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeProfileRuntimeCopy(
     const std::string& workingDirectory, std::string_view bytes,
-    const RuntimeConfigDefinition& definition) {
+    const RuntimeConfigDefinition& definition, std::string_view geoSourcePreset) {
+    const auto* preset = FindGeoSourcePreset(geoSourcePreset);
+    if (!preset) {
+        return MakeError(ErrorKind::InvalidConfig, "unknown Geo download source");
+    }
     const auto valid = ValidateRuntimeConfigDefinition(definition);
     if (!valid) {
         return valid.error();
@@ -401,7 +430,7 @@ core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeProfileRuntimeCopy(
         const YAML::Node source = YAML::Load(std::string(bytes));
         YAML::Node sanitized(YAML::NodeType::Map);
         for (const auto& pair : source) {
-            if (IsProfileSetting(pair.first.Scalar())) {
+            if (pair.first.IsScalar() && !IsManagedSetting(pair.first.Scalar())) {
                 sanitized.force_insert(pair.first, YAML::Clone(pair.second));
             }
         }
@@ -409,7 +438,8 @@ core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeProfileRuntimeCopy(
         if (HasLocalProxyDependency(settings["proxies"])) {
             return MakeError(ErrorKind::ConfigFailed, "profile depends on an external local TLS file");
         }
-        // Keep provider names/references intact. Never honor user-selected cache paths.
+        // Keep provider names, references and cache paths: validation already
+        // rejects unsafe paths, and persistent caches avoid re-downloading.
         for (const auto* key : {"proxy-providers", "rule-providers"}) {
             auto providers = settings[key];
             if (providers && providers.IsMap()) {
@@ -420,13 +450,8 @@ core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeProfileRuntimeCopy(
                         return MakeError(ErrorKind::ConfigFailed,
                                          "profile depends on an external local TLS file");
                     }
-                    provider.remove("path");
                 }
             }
-        }
-        auto dns = settings["dns"];
-        if (dns && dns.IsMap()) {
-            dns.remove("listen");
         }
         sanitized["allow-lan"] = false;
         sanitized["bind-address"] = "127.0.0.1";
@@ -435,6 +460,12 @@ core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeProfileRuntimeCopy(
             (definition.host == "::1" ? "[::1]" : definition.host) +
             ":" + std::to_string(definition.port);
         sanitized["secret"] = definition.secret;
+        // Reference behaviour: never let the kernel download Geo data at start.
+        sanitized["geodata-mode"] = false;
+        sanitized["geo-auto-update"] = false;
+        if (const auto applied = ApplyGeoSource(sanitized, *preset); !applied) {
+            return applied.error();
+        }
         YAML::Emitter emitter;
         emitter << sanitized;
         if (!emitter.good()) {
@@ -442,7 +473,7 @@ core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeProfileRuntimeCopy(
         }
         return CreateCopy(workingDirectory, emitter.c_str(),
                           {definition.host, definition.port, definition.mixedPort,
-                           definition.secret, true}, true);
+                           definition.secret, true});
     } catch (const YAML::Exception&) {
         return MakeError(ErrorKind::ConfigFailed, "could not isolate the imported profile");
     }
@@ -450,7 +481,11 @@ core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeProfileRuntimeCopy(
 
 core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeLegacyRuntimeCopy(
     const std::string& workingDirectory, const std::string& configPath,
-    const RuntimeConfigDefinition& definition) {
+    const RuntimeConfigDefinition& definition, std::string_view geoSourcePreset) {
+    const auto* preset = FindGeoSourcePreset(geoSourcePreset);
+    if (!preset) {
+        return MakeError(ErrorKind::InvalidConfig, "unknown Geo download source");
+    }
     const auto ensured = EnsureRuntimeConfig(configPath, definition);
     if (!ensured) {
         return ensured.error();
@@ -467,7 +502,27 @@ core::Result<std::unique_ptr<RuntimeConfigCopy>> MakeLegacyRuntimeCopy(
         return info.error();
     }
     info.value().generated = ensured.value().generated;
-    return CreateCopy(workingDirectory, exact, std::move(info.value()), false);
+    if (preset->baseUrl.empty()) {
+        return CreateCopy(workingDirectory, exact, std::move(info.value()));
+    }
+    try {
+        const auto documents = YAML::LoadAll(exact);
+        if (documents.size() != 1 || !documents.front().IsMap()) {
+            return MakeError(ErrorKind::ConfigFailed, "Geo source requires a single YAML mapping");
+        }
+        auto root = documents.front();
+        if (const auto applied = ApplyGeoSource(root, *preset); !applied) {
+            return applied.error();
+        }
+        YAML::Emitter emitter;
+        emitter << root;
+        if (emitter.good()) {
+            return CreateCopy(workingDirectory, emitter.c_str(), std::move(info.value()));
+        }
+    } catch (const YAML::Exception&) {
+        // YAML diagnostics may contain raw configuration values.
+    }
+    return MakeError(ErrorKind::ConfigFailed, "could not apply Geo source to the legacy config");
 }
 
 }  // namespace clashyuka::runtime

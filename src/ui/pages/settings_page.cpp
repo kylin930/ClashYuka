@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include <wx/choice.h>
 #include <wx/dirdlg.h>
 #include <wx/filedlg.h>
 #include <wx/sizer.h>
@@ -11,6 +12,7 @@
 #include "clashyuka/app/app_text.h"
 #include "clashyuka/core/app_info.h"
 #include "clashyuka/runtime/app_update.h"
+#include "clashyuka/runtime/runtime_config.h"
 #include "clashyuka/runtime/settings_store.h"
 #include "clashyuka/ui/components/button.h"
 #include "clashyuka/ui/components/list_item.h"
@@ -212,6 +214,18 @@ SettingsPage::SettingsPage(wxWindow* parent, app::AppController& controller)
 
     autoStart_ = new Switch(mihomo);
     AddSettingRow(mihomoSizer, mihomo, "Start kernel with the app", autoStart_);
+    pages::AddSpacer(mihomoSizer, mihomo, SpaceDp(Space::Md));
+
+    const wxString geoSourceLabel = "Geo data download source";
+    wxArrayString geoSourceLabels;
+    for (const auto& preset : runtime::kGeoSourcePresets) {
+        geoSourceLabels.Add(wxString::FromUTF8(preset.label.data(), preset.label.size()));
+    }
+    geoSourceChoice_ = new wxChoice(mihomo, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                   geoSourceLabels);
+    geoSourceChoice_->SetName(geoSourceLabel);
+    geoSourceChoice_->SetSelection(0);
+    AddSettingRow(mihomoSizer, mihomo, geoSourceLabel, geoSourceChoice_);
     pages::AddSpacer(mihomoSizer, mihomo, SpaceDp(Space::Md));
 
     auto* testUrlRow = new wxBoxSizer(wxHORIZONTAL);
@@ -461,6 +475,14 @@ void SettingsPage::SyncMihomoSettings() {
     apiPortField_->SetValue(wxString::Format("%d", settings.controllerPort));
     secretField_->SetValue(wxString::FromUTF8(settings.secret));
     autoStart_->SetValue(settings.autoStartKernel, false);
+    int geoSourceIndex = 0;
+    for (std::size_t i = 0; i < runtime::kGeoSourcePresets.size(); ++i) {
+        if (runtime::kGeoSourcePresets[i].id == settings.geoSourcePreset) {
+            geoSourceIndex = static_cast<int>(i);
+            break;
+        }
+    }
+    geoSourceChoice_->SetSelection(geoSourceIndex);
     systemProxy_->SetValue(settings.enableSystemProxy, false);
     testUrlField_->SetValue(wxString::FromUTF8(settings.proxyTestUrl));
     testTimeoutField_->SetValue(wxString::Format("%d", settings.proxyTestTimeoutMs));
@@ -637,6 +659,9 @@ void SettingsPage::SaveMihomoSettings() {
     settings.controllerPort = static_cast<int>(port);
     settings.secret = secretField_->GetValue().utf8_string();
     settings.autoStartKernel = autoStart_->GetValue();
+    const int geoSourceIndex = geoSourceChoice_->GetSelection();
+    settings.geoSourcePreset = runtime::kGeoSourcePresets[
+        geoSourceIndex == wxNOT_FOUND ? 0 : static_cast<std::size_t>(geoSourceIndex)].id;
     settings.proxyTestUrl = testUrlField_->GetValue().utf8_string();
     settings.proxyTestTimeoutMs = static_cast<int>(testTimeout);
     settings.kernelInstallDir = installDirField_->GetValue().utf8_string();
